@@ -4,17 +4,10 @@ import "time"
 
 // JoinResponse is the payload returned by POST /api/streams.
 type JoinResponse struct {
-	Token               string `json:"token"`
-	ReadToken           string `json:"read_token"`
-	StreamID            string `json:"stream_id"`
-	Region              string `json:"region"`
-	ExpiresAt           string `json:"expires_at"`
-	ReadTokenExpiresAt  string `json:"read_token_expires_at,omitempty"`
-	MediaServerPublicIP string `json:"media_server_public_ip,omitempty"`
-	SignalingURL        string `json:"signaling_url,omitempty"`
-	TurnURL             string `json:"turn_url,omitempty"`
-	TurnUsername        string `json:"turn_username,omitempty"`
-	TurnCredential      string `json:"turn_credential,omitempty"`
+	Token       string   `json:"token"`
+	StreamID    string   `json:"stream_id"`
+	ExpiresAt   string   `json:"expires_at"`
+	GatewayURLs []string `json:"gateway_urls"`
 }
 
 // FrameOptions configures a frame fetch request.
