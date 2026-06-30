@@ -1,166 +1,84 @@
-// Package client provides a Go client for the Argus streaming platform.
+// Package client is a Go client for the Argus video streaming platform.
 //
-// Customer servers use this library to:
-//   - Request join tokens for new streams (POST /api/streams)
-//   - Fetch decoded video frames from the read gateway
+// Argus is a regionally distributed video ingestion service: end users stream
+// video from their browsers to Argus media servers, and application servers
+// fetch still frames or short segments on demand whenever an agent needs to
+// "see". This package is the server-side half of that story — it is intended to
+// run on a customer's own backend, authenticated with the customer's API key.
 //
-// Basic usage:
+// It covers three things a customer server needs to do:
+//
+//   - Mint join tokens for new streams, which are handed to a browser so it can
+//     publish video (JoinStream / JoinStreamWithOptions).
+//   - Fetch decoded frames from a regional frame gateway (FetchFrame).
+//   - Verify and decode change-trigger webhooks delivered by Argus when a
+//     stream's video changes (ParseWebhook).
+//
+// The package depends only on the standard library so it can be vendored or
+// imported into external applications without pulling in the rest of Argus.
+//
+// # Authentication
+//
+// Two distinct credentials are in play and must not be confused:
+//
+//   - The API key identifies the customer to the control plane and frame
+//     gateway. It is long-lived and secret; keep it server-side. The Client
+//     sends it as an "Authorization: ApiKey <key>" header.
+//   - The read token is a short-lived JWT returned in JoinResponse.Token (and
+//     mirrored for reads). It is scoped to a single stream and is what
+//     FetchFrame presents as a bearer token.
+//
+// # Typical flow
 //
 //	c := client.New("https://argus.example.com", "argus_api_key_...")
-//	j, err := c.JoinStream(ctx)
-//	...
-//	frame, err := c.FetchFrame(ctx, gatewayURL, j.StreamID, readToken, nil)
+//
+//	// 1. Mint a join token and forward it to the browser.
+//	join, err := c.JoinStream(ctx)
+//	if err != nil {
+//		// ...
+//	}
+//	// hand join.Token and join.GatewayURLs to the end user's browser
+//
+//	// 2. Later, fetch a frame from the stream's gateway.
+//	frame, err := c.FetchFrame(ctx, join.GatewayURLs[0], join.StreamID, join.Token, nil)
 package client
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 )
 
-// Client is an Argus API client.
+// defaultTimeout is the request timeout applied by New. Callers needing a
+// different timeout (or transport, proxy, etc.) should use NewWithHTTPClient.
+const defaultTimeout = 30 * time.Second
+
+// Client talks to the Argus control plane and frame gateways on behalf of a
+// single customer account. It is safe for concurrent use by multiple
+// goroutines.
 type Client struct {
 	baseURL string
 	apiKey  string
 	client  *http.Client
 }
 
-// New creates an Argus client. baseURL should be the root URL of the Argus
-// control plane (e.g. "https://argus.example.com"). apiKey is the customer's
-// API key used for Authorization: ApiKey <key> headers.
+// New creates a Client with sensible defaults.
+//
+// baseURL is the root URL of the Argus control plane (e.g.
+// "https://argus.example.com"); a trailing slash is trimmed. apiKey is the
+// customer's API key, sent as an "Authorization: ApiKey <key>" header on
+// control-plane requests.
 func New(baseURL, apiKey string) *Client {
-	return NewWithHTTPClient(baseURL, apiKey, &http.Client{Timeout: 30 * time.Second})
+	return NewWithHTTPClient(baseURL, apiKey, &http.Client{Timeout: defaultTimeout})
 }
 
-// NewWithHTTPClient creates an Argus client with a custom HTTP client.
+// NewWithHTTPClient is like New but uses the supplied *http.Client, letting the
+// caller control timeouts, transport, proxies, and TLS configuration. The
+// client must not be nil.
 func NewWithHTTPClient(baseURL, apiKey string, httpClient *http.Client) *Client {
-	baseURL = strings.TrimRight(baseURL, "/")
 	return &Client{
-		baseURL: baseURL,
+		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
 		client:  httpClient,
 	}
-}
-
-// JoinStream creates a new stream and returns the join token bundle.
-// The caller should forward the Token and gateway URLs to the browser.
-func (c *Client) JoinStream(ctx context.Context) (*JoinResponse, error) {
-	return c.JoinStreamWithOptions(ctx, nil)
-}
-
-// joinStreamBody mirrors the server's createStreamRequest JSON shape.
-type joinStreamBody struct {
-	Region  string             `json:"region,omitempty"`
-	Trigger *joinStreamTrigger `json:"trigger,omitempty"`
-}
-
-type joinStreamTrigger struct {
-	WebhookURL     string   `json:"webhook_url"`
-	Threshold      *float64 `json:"threshold,omitempty"`
-	Track          string   `json:"track,omitempty"`
-	PollIntervalMs *int     `json:"poll_interval_ms,omitempty"`
-}
-
-// JoinStreamWithOptions creates a new stream with the given options and returns
-// the join token bundle. A nil opts is equivalent to JoinStream(ctx).
-func (c *Client) JoinStreamWithOptions(ctx context.Context, opts *JoinOptions) (*JoinResponse, error) {
-	var body joinStreamBody
-	if opts != nil {
-		body.Region = opts.Region
-		if opts.Trigger != nil {
-			body.Trigger = &joinStreamTrigger{
-				WebhookURL:     opts.Trigger.WebhookURL,
-				Threshold:      opts.Trigger.Threshold,
-				Track:          opts.Trigger.Track,
-				PollIntervalMs: opts.Trigger.PollIntervalMs,
-			}
-		}
-	}
-
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/streams", bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "ApiKey "+c.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var jr JoinResponse
-	if err := json.NewDecoder(resp.Body).Decode(&jr); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-	return &jr, nil
-}
-
-// FetchFrame retrieves a single decoded frame from the read gateway.
-// gatewayURL is the root URL of the Argus frame gateway (e.g.
-// "https://gateway.argus.example.com").  The returned bytes are a JPEG or
-// PNG image depending on opts.Format.  Use the ReadToken from JoinResponse
-// for readToken.
-func (c *Client) FetchFrame(ctx context.Context, gatewayURL, streamUUID, readToken string, opts *FrameOptions) ([]byte, error) {
-	if opts == nil {
-		opts = &FrameOptions{}
-	}
-	track := opts.Track
-	if track == "" {
-		track = "camera"
-	}
-	format := opts.Format
-	if format == "" {
-		format = "jpeg"
-	}
-	gatewayURL = strings.TrimRight(gatewayURL, "/")
-
-	url := fmt.Sprintf("%s/frames/%s?track=%s&format=%s", gatewayURL, streamUUID, track, format)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+readToken)
-
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-
-	client := c.client
-	if timeout != client.Timeout {
-		// Clone client with per-request timeout.
-		cc := *client
-		cc.Timeout = timeout
-		client = &cc
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
-	}
-
-	return io.ReadAll(resp.Body)
 }
