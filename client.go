@@ -9,10 +9,11 @@
 //	c := client.New("https://argus.example.com", "argus_api_key_...")
 //	j, err := c.JoinStream(ctx)
 //	...
-//	frame, err := c.FetchFrame(ctx, j.StreamID, j.ReadToken)
+//	frame, err := c.FetchFrame(ctx, gatewayURL, j.StreamID, readToken, nil)
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -47,10 +48,46 @@ func NewWithHTTPClient(baseURL, apiKey string, httpClient *http.Client) *Client 
 }
 
 // JoinStream creates a new stream and returns the join token bundle.
-// The caller should forward the Token and SignalingURL to the browser,
-// and keep the ReadToken for fetching frames.
+// The caller should forward the Token and gateway URLs to the browser.
 func (c *Client) JoinStream(ctx context.Context) (*JoinResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/streams", strings.NewReader("{}"))
+	return c.JoinStreamWithOptions(ctx, nil)
+}
+
+// joinStreamBody mirrors the server's createStreamRequest JSON shape.
+type joinStreamBody struct {
+	Region  string             `json:"region,omitempty"`
+	Trigger *joinStreamTrigger `json:"trigger,omitempty"`
+}
+
+type joinStreamTrigger struct {
+	WebhookURL     string   `json:"webhook_url"`
+	Threshold      *float64 `json:"threshold,omitempty"`
+	Track          string   `json:"track,omitempty"`
+	PollIntervalMs *int     `json:"poll_interval_ms,omitempty"`
+}
+
+// JoinStreamWithOptions creates a new stream with the given options and returns
+// the join token bundle. A nil opts is equivalent to JoinStream(ctx).
+func (c *Client) JoinStreamWithOptions(ctx context.Context, opts *JoinOptions) (*JoinResponse, error) {
+	var body joinStreamBody
+	if opts != nil {
+		body.Region = opts.Region
+		if opts.Trigger != nil {
+			body.Trigger = &joinStreamTrigger{
+				WebhookURL:     opts.Trigger.WebhookURL,
+				Threshold:      opts.Trigger.Threshold,
+				Track:          opts.Trigger.Track,
+				PollIntervalMs: opts.Trigger.PollIntervalMs,
+			}
+		}
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/streams", bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
