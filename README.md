@@ -32,12 +32,16 @@ server fetches frames whenever its agent needs one.
 ## Installation
 
 ```bash
-go get github.com/furious-luke/go-projects/argus/client
+go get github.com/furious-luke/argus-go
 ```
 
 ```go
-import "github.com/furious-luke/go-projects/argus/client"
+import argus "github.com/furious-luke/argus-go"
 ```
+
+The module path is `github.com/furious-luke/argus-go`; the package it exports is
+named `argus`, so call sites read `argus.New(...)`, `argus.ParseWebhook(...)`,
+and so on.
 
 ## Authentication
 
@@ -56,14 +60,14 @@ server; never ship it to a browser.
 ### Create a client
 
 ```go
-c := client.New("https://argus.example.com", "argus_api_key_...")
+c := argus.New("https://argus.example.com", "argus_api_key_...")
 ```
 
 `New` applies a 30s request timeout. To control the transport, timeouts, or TLS,
 pass your own `*http.Client`:
 
 ```go
-c := client.NewWithHTTPClient(baseURL, apiKey, &http.Client{Timeout: time.Minute})
+c := argus.NewWithHTTPClient(baseURL, apiKey, &http.Client{Timeout: time.Minute})
 ```
 
 ### Mint a join token
@@ -82,9 +86,9 @@ To pin a region or configure a change-trigger webhook, use
 
 ```go
 threshold := 0.85
-join, err := c.JoinStreamWithOptions(ctx, &client.JoinOptions{
+join, err := c.JoinStreamWithOptions(ctx, &argus.JoinOptions{
     Region: "eu-west-1", // optional; omit to let Argus choose
-    Trigger: &client.TriggerConfig{
+    Trigger: &argus.TriggerConfig{
         WebhookURL: "https://my-app.example.com/argus/webhook",
         Threshold:  &threshold, // optional change-detection threshold in (0,1]
         Track:      "camera",   // optional; "camera" or "screen"
@@ -110,7 +114,7 @@ if err != nil {
 Override the track, format, or per-request timeout with `FrameOptions`:
 
 ```go
-frame, err := c.FetchFrame(ctx, gatewayURL, streamID, readToken, &client.FrameOptions{
+frame, err := c.FetchFrame(ctx, gatewayURL, streamID, readToken, &argus.FrameOptions{
     Track:   "screen", // "camera" (default) or "screen"
     Format:  "png",    // "jpeg" (default) or "png"
     Timeout: 5 * time.Second,
@@ -132,14 +136,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     }
 
     secret := h.secretForStream(/* look up by stream */) // your storage
-    ev, err := client.ParseWebhook(secret, r.Header, body)
+    ev, err := argus.ParseWebhook(secret, r.Header, body)
     switch {
-    case errors.Is(err, client.ErrInvalidSignature),
-        errors.Is(err, client.ErrMissingSignature),
-        errors.Is(err, client.ErrStaleWebhook):
+    case errors.Is(err, argus.ErrInvalidSignature),
+        errors.Is(err, argus.ErrMissingSignature),
+        errors.Is(err, argus.ErrStaleWebhook):
         http.Error(w, "unauthorized", http.StatusUnauthorized)
         return
-    case errors.Is(err, client.ErrMalformedWebhook):
+    case errors.Is(err, argus.ErrMalformedWebhook):
         http.Error(w, "bad request", http.StatusBadRequest)
         return
     case err != nil:
@@ -191,8 +195,9 @@ HTTP status and response body on a non-success response.
 
 ## Testing
 
-Tests follow the repository's spec-test convention (`TestSpec_*`), exercising the
-client against in-process fake Argus endpoints:
+Tests are behavioural specs (`TestSpec_*`) that exercise the client against
+in-process fake Argus endpoints — see `client_spec_test.go` for the contracts and
+`client_arrange_test.go` / `client_actor_test.go` for the harness:
 
 ```bash
 go test ./...

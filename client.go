@@ -41,7 +41,7 @@
 //
 //	// 2. Later, fetch a frame from the stream's gateway.
 //	frame, err := c.FetchFrame(ctx, join.GatewayURLs[0], join.StreamID, join.Token, nil)
-package client
+package argus
 
 import (
 	"net/http"

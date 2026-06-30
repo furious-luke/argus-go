@@ -1,4 +1,4 @@
-package client
+package argus
 
 import (
 	"net/http/httptest"
