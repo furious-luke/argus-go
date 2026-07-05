@@ -14,8 +14,10 @@ import (
 // publish video; the customer server retains StreamID (and WebhookSecret, if a
 // trigger was configured) for later reads and webhook verification.
 type JoinResponse struct {
-	// Token is the short-lived join JWT. Forward it to the browser to publish,
-	// and present it as the read token when calling FetchFrame.
+	// Token is the short-lived join JWT. Forward it to the browser to publish.
+	// It is NOT the read token — the frame gateway rejects it. The read token
+	// for FetchFrame is minted by the gateway during signaling and relayed back
+	// from the browser (see FetchFrame).
 	Token string `json:"token"`
 	// StreamID is the Argus-generated UUID of the new stream.
 	StreamID string `json:"stream_id"`

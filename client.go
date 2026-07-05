@@ -19,14 +19,19 @@
 //
 // # Authentication
 //
-// Two distinct credentials are in play and must not be confused:
+// Three distinct credentials are in play, and the join and read tokens must not
+// be confused:
 //
-//   - The API key identifies the customer to the control plane and frame
-//     gateway. It is long-lived and secret; keep it server-side. The Client
-//     sends it as an "Authorization: ApiKey <key>" header.
-//   - The read token is a short-lived JWT returned in JoinResponse.Token (and
-//     mirrored for reads). It is scoped to a single stream and is what
-//     FetchFrame presents as a bearer token.
+//   - The API key identifies the customer to the control plane. It is
+//     long-lived and secret; keep it server-side. The Client sends it as an
+//     "Authorization: ApiKey <key>" header.
+//   - The join token is a short-lived JWT returned in JoinResponse.Token. It
+//     authorizes publishing and is forwarded to the browser. The frame gateway
+//     rejects it — it is not a read token.
+//   - The read token is a separate short-lived JWT minted by the frame gateway
+//     during signaling. It is surfaced to the browser as frameReadToken and
+//     relayed back to your server, which presents it to FetchFrame as a bearer
+//     token. It is scoped to a single stream and pinned to the serving region.
 //
 // # Typical flow
 //
@@ -39,8 +44,11 @@
 //	}
 //	// hand join.Token and join.GatewayURLs to the end user's browser
 //
-//	// 2. Later, fetch a frame from the stream's gateway.
-//	frame, err := c.FetchFrame(ctx, join.GatewayURLs[0], join.StreamID, join.Token, nil)
+//	// 2. The browser connects, receives its read token (frameReadToken), and
+//	//    relays it back to your server as readToken.
+//
+//	// 3. Fetch a frame from the stream's gateway with that read token.
+//	frame, err := c.FetchFrame(ctx, join.GatewayURLs[0], join.StreamID, readToken, nil)
 package argus
 
 import (

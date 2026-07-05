@@ -33,7 +33,10 @@ type FrameOptions struct {
 // gatewayURL is the base URL of the gateway serving the stream — use one of the
 // values from JoinResponse.GatewayURLs. streamID is the stream's UUID
 // (JoinResponse.StreamID) and readToken is the bearer token authorizing the
-// read (JoinResponse.Token). A nil opts uses the default track and format.
+// read. The read token is NOT JoinResponse.Token (that is the join token, which
+// this endpoint rejects); it is minted by the gateway during signaling, surfaced
+// to the browser as frameReadToken, and relayed back to your server. A nil opts
+// uses the default track and format.
 //
 // The returned bytes are the encoded image (JPEG or PNG per opts.Format).
 func (c *Client) FetchFrame(ctx context.Context, gatewayURL, streamID, readToken string, opts *FrameOptions) ([]byte, error) {
