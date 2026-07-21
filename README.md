@@ -121,6 +121,15 @@ frame, err := c.FetchFrame(ctx, gatewayURL, streamID, readToken, &argus.FrameOpt
 })
 ```
 
+Argus does not return a retained frame as current after media input has stalled.
+If no complete sample has arrived for 15 seconds, the frame gateway returns
+`503 Service Unavailable`. `FetchFrame` automatically retries this response for
+a short, fixed window so a publisher recovery is usually invisible to callers.
+If the stream is still stalled after five attempts, it returns a
+`*StaleFrameError`; use `errors.Is(err, argus.ErrStaleFrame)` and inspect
+`FrameAge` when you need to distinguish this state from other failures. Raw HTTP
+callers can inspect `X-Argus-Frame-Age-Ms` and `Retry-After` on stale responses.
+
 ### Receive change-trigger webhooks
 
 When a stream is created with a `Trigger`, Argus watches its video and POSTs an

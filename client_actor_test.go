@@ -30,6 +30,7 @@ type CustomerServerActor struct {
 	controlPlane *fakeControlPlane
 	gateway      *fakeGateway
 	gatewayURL   string
+	retryDelays  []time.Duration
 }
 
 // MustJoin creates a stream with the given options and fails the test on error.
@@ -84,6 +85,45 @@ func (a *CustomerServerActor) SetJoinResponse(status int, body string) {
 func (a *CustomerServerActor) SetFrameResponse(status int, body []byte) {
 	a.gateway.status = status
 	a.gateway.body = body
+	a.gateway.headers = make(http.Header)
+	a.gateway.responses = nil
+}
+
+func (a *CustomerServerActor) MustGatewayRecoverAfter(staleResponses int, age time.Duration, frame []byte) {
+	a.t.Helper()
+	responses := make([]fakeFrameResponse, 0, staleResponses+1)
+	for range staleResponses {
+		responses = append(responses, staleFakeFrameResponse(age, time.Second))
+	}
+	responses = append(responses, fakeFrameResponse{status: http.StatusOK, body: append([]byte(nil), frame...), headers: make(http.Header)})
+	a.gateway.responses = responses
+}
+
+func (a *CustomerServerActor) MustGatewayRemainStalled(age, retryAfter time.Duration) {
+	a.t.Helper()
+	response := staleFakeFrameResponse(age, retryAfter)
+	a.gateway.status = response.status
+	a.gateway.body = response.body
+	a.gateway.headers = response.headers
+	a.gateway.responses = nil
+}
+
+func (a *CustomerServerActor) MustGatewayReturnUnmarkedUnavailable() {
+	a.t.Helper()
+	a.gateway.status = http.StatusServiceUnavailable
+	a.gateway.body = []byte("temporarily unavailable")
+	a.gateway.headers = make(http.Header)
+	a.gateway.responses = nil
+}
+
+func (a *CustomerServerActor) FrameRequestCount() int {
+	a.t.Helper()
+	return a.gateway.attempts
+}
+
+func (a *CustomerServerActor) RetryDelays() []time.Duration {
+	a.t.Helper()
+	return append([]time.Duration(nil), a.retryDelays...)
 }
 
 // WebhookEndpointActor signs change-trigger deliveries exactly as an Argus
@@ -162,17 +202,44 @@ func (f *fakeControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type fakeGateway struct {
 	status     int
 	body       []byte
+	headers    http.Header
+	responses  []fakeFrameResponse
+	attempts   int
 	lastTarget string
 	lastAuth   string
 }
 
+type fakeFrameResponse struct {
+	status  int
+	body    []byte
+	headers http.Header
+}
+
 func newFakeGateway() *fakeGateway {
-	return &fakeGateway{status: http.StatusOK, body: []byte{0xFF, 0xD8, 0xFF}}
+	return &fakeGateway{status: http.StatusOK, body: []byte{0xFF, 0xD8, 0xFF}, headers: make(http.Header)}
 }
 
 func (f *fakeGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.attempts++
 	f.lastTarget = r.URL.RequestURI()
 	f.lastAuth = r.Header.Get("Authorization")
-	w.WriteHeader(f.status)
-	_, _ = w.Write(f.body)
+	response := fakeFrameResponse{status: f.status, body: f.body, headers: f.headers}
+	if len(f.responses) > 0 {
+		response = f.responses[0]
+		f.responses = f.responses[1:]
+	}
+	for name, values := range response.headers {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	w.WriteHeader(response.status)
+	_, _ = w.Write(response.body)
+}
+
+func staleFakeFrameResponse(age, retryAfter time.Duration) fakeFrameResponse {
+	headers := make(http.Header)
+	headers.Set(frameAgeHeader, strconv.FormatInt(age.Milliseconds(), 10))
+	headers.Set("Retry-After", strconv.FormatInt(int64(retryAfter/time.Second), 10))
+	return fakeFrameResponse{status: http.StatusServiceUnavailable, body: []byte("frame is stale"), headers: headers}
 }

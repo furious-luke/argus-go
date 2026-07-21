@@ -102,6 +102,45 @@ func TestSpec_Frame_SurfacesServerError(t *testing.T) {
 	assert.Contains(t, err.Error(), "stream not found")
 }
 
+func TestSpec_Frame_TransientStallRecoversWithoutSurfacingOldFrameOrError(t *testing.T) {
+	a := newArranger(t)
+	server := a.RecoveringCustomerServer()
+	freshFrame := []byte("fresh-frame")
+	server.MustGatewayRecoverAfter(2, 17*time.Second, freshFrame)
+	frame := server.MustFetchFrame("stream-1", "read-jwt", nil)
+	assert.Equal(t, freshFrame, frame)
+	assert.Equal(t, 3, server.FrameRequestCount())
+}
+
+func TestSpec_Frame_PersistentStallReturnsTypedErrorAfterBoundedRecovery(t *testing.T) {
+	a := newArranger(t)
+	server := a.RecoveringCustomerServer()
+	server.MustGatewayRemainStalled(23*time.Second, time.Second)
+	_, err := server.FetchFrame("stream-1", "read-jwt", nil)
+	var stale *StaleFrameError
+	require.ErrorAs(t, err, &stale)
+	assert.ErrorIs(t, err, ErrStaleFrame)
+	assert.Equal(t, 23*time.Second, stale.FrameAge)
+	assert.Equal(t, 5, server.FrameRequestCount())
+}
+
+func TestSpec_Frame_OnlyAuthoritativeStaleResponseIsRetried(t *testing.T) {
+	a := newArranger(t)
+	server := a.RecoveringCustomerServer()
+	server.MustGatewayReturnUnmarkedUnavailable()
+	_, err := server.FetchFrame("stream-1", "read-jwt", nil)
+	assert.NotErrorIs(t, err, ErrStaleFrame)
+	assert.Equal(t, 1, server.FrameRequestCount())
+}
+
+func TestSpec_Frame_RetryAdviceIsBoundedBeforeUse(t *testing.T) {
+	a := newArranger(t)
+	server := a.RecoveringCustomerServer()
+	server.MustGatewayRemainStalled(20*time.Second, 30*time.Second)
+	server.FetchFrame("stream-1", "read-jwt", nil)
+	assert.Equal(t, []time.Duration{2 * time.Second, 2 * time.Second, 2 * time.Second, 2 * time.Second}, server.RetryDelays())
+}
+
 func TestSpec_Webhook_ValidSignatureDecodesFrame(t *testing.T) {
 	a := newArranger(t)
 	endpoint := a.WebhookEndpoint()
