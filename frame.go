@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -58,8 +57,10 @@ type FrameOptions struct {
 
 // FetchFrame retrieves a single decoded frame from a regional frame gateway.
 //
-// gatewayURL is the base URL of the gateway serving the stream — use one of the
-// values from JoinResponse.GatewayURLs. streamID is the stream's UUID
+// gatewayURL identifies the gateway serving the stream. It may be the winning
+// ws(s) signaling URL from JoinResponse.GatewayURLs (argus-js
+// selectedGatewayURL) or an http(s) gateway base URL; the client normalizes
+// either form. streamID is the stream's UUID
 // (JoinResponse.StreamID) and readToken is the bearer token authorizing the
 // read. The read token is NOT JoinResponse.Token (that is the join token, which
 // this endpoint rejects); it is minted by the gateway during signaling, surfaced
@@ -83,12 +84,17 @@ func (c *Client) FetchFrame(ctx context.Context, gatewayURL, streamID, readToken
 		format = "jpeg"
 	}
 
-	endpoint := fmt.Sprintf("%s/frames/%s?track=%s&format=%s",
-		strings.TrimRight(gatewayURL, "/"),
-		url.PathEscape(streamID),
-		url.QueryEscape(track),
-		url.QueryEscape(format),
-	)
+	endpointURL, err := gatewayBaseURL(gatewayURL, gatewayHTTP)
+	if err != nil {
+		return nil, err
+	}
+	endpointURL.Path = "/frames/" + streamID
+	endpointURL.RawPath = "/frames/" + url.PathEscape(streamID)
+	query := endpointURL.Query()
+	query.Set("track", track)
+	query.Set("format", format)
+	endpointURL.RawQuery = query.Encode()
+	endpoint := endpointURL.String()
 	frameClient := c.frameHTTPClient(opts.Timeout)
 	for attempt := 0; attempt < staleFrameMaxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)

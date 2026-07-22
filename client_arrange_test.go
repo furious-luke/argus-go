@@ -19,9 +19,14 @@ type Arranger interface {
 	// instantaneous while preserving every retry decision and attempt.
 	RecoveringCustomerServer() *CustomerServerActor
 
-	// WebhookEndpoint returns an actor for signing webhook deliveries the way an
-	// Argus media server does and verifying them through ParseWebhook.
-	WebhookEndpoint() *WebhookEndpointActor
+	// NotifyGateway returns an actor wired to a fake regional gateway that upgrades
+	// /notify to a WebSocket and pushes queued notification messages, letting a
+	// spec drive Client.Subscribe against it.
+	NotifyGateway() *NotifyGatewayActor
+
+	// TLSNotifyGateway returns a notify gateway whose certificate is trusted only
+	// by the custom HTTP client supplied through NewWithHTTPClient.
+	TLSNotifyGateway() *NotifyGatewayActor
 }
 
 func (a *defaultArranger) RecoveringCustomerServer() *CustomerServerActor {
@@ -67,6 +72,28 @@ func (a *defaultArranger) CustomerServer() *CustomerServerActor {
 	}
 }
 
-func (a *defaultArranger) WebhookEndpoint() *WebhookEndpointActor {
-	return &WebhookEndpointActor{t: a.t}
+func (a *defaultArranger) NotifyGateway() *NotifyGatewayActor {
+	gateway := newFakeNotifyGateway()
+	server := httptest.NewServer(gateway)
+	a.t.Cleanup(server.Close)
+
+	return &NotifyGatewayActor{
+		t:          a.t,
+		client:     New("https://control.example", defaultAPIKey),
+		gateway:    gateway,
+		gatewayURL: server.URL,
+	}
+}
+
+func (a *defaultArranger) TLSNotifyGateway() *NotifyGatewayActor {
+	gateway := newFakeNotifyGateway()
+	server := httptest.NewTLSServer(gateway)
+	a.t.Cleanup(server.Close)
+
+	return &NotifyGatewayActor{
+		t:          a.t,
+		client:     NewWithHTTPClient("https://control.example", defaultAPIKey, server.Client()),
+		gateway:    gateway,
+		gatewayURL: server.URL,
+	}
 }

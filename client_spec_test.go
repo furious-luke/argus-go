@@ -1,6 +1,7 @@
 package argus
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -30,24 +31,11 @@ func TestSpec_Join_AuthenticatesWithAPIKey(t *testing.T) {
 	assert.Equal(t, "ApiKey "+defaultAPIKey, server.LastJoinAuthHeader())
 }
 
-func TestSpec_Join_ForwardsRegionAndTrigger(t *testing.T) {
+func TestSpec_Join_ForwardsRegion(t *testing.T) {
 	a := newArranger(t)
 	server := a.CustomerServer()
-	server.MustJoin(&JoinOptions{
-		Region:  "eu-west-1",
-		Trigger: &TriggerConfig{WebhookURL: "https://example.com/webhook"},
-	})
-	sent := server.LastJoinRequest()
-	assert.Equal(t, "eu-west-1", sent.Region)
-	require.NotNil(t, sent.Trigger)
-	assert.Equal(t, "https://example.com/webhook", sent.Trigger.WebhookURL)
-}
-
-func TestSpec_Join_OmitsTriggerWhenUnset(t *testing.T) {
-	a := newArranger(t)
-	server := a.CustomerServer()
-	server.MustJoin(&JoinOptions{Region: "us-east-1"})
-	assert.Nil(t, server.LastJoinRequest().Trigger)
+	server.MustJoin(&JoinOptions{Region: "eu-west-1"})
+	assert.Equal(t, "eu-west-1", server.LastJoinRequest().Region)
 }
 
 func TestSpec_Join_SurfacesServerError(t *testing.T) {
@@ -83,6 +71,15 @@ func TestSpec_Frame_HonoursTrackAndFormat(t *testing.T) {
 	target, _ := server.LastFrameRequest()
 	assert.Contains(t, target, "track=screen")
 	assert.Contains(t, target, "format=png")
+}
+
+func TestSpec_Frame_AcceptsJoinResponseSignalingURL(t *testing.T) {
+	a := newArranger(t)
+	server := a.CustomerServer()
+	server.UseSignalingGatewayURL()
+	server.MustFetchFrame("stream-1", "read-jwt", nil)
+	target, _ := server.LastFrameRequest()
+	assert.Contains(t, target, "/frames/stream-1")
 }
 
 func TestSpec_Frame_AuthenticatesWithReadToken(t *testing.T) {
@@ -141,93 +138,189 @@ func TestSpec_Frame_RetryAdviceIsBoundedBeforeUse(t *testing.T) {
 	assert.Equal(t, []time.Duration{2 * time.Second, 2 * time.Second, 2 * time.Second, 2 * time.Second}, server.RetryDelays())
 }
 
-func TestSpec_Webhook_ValidSignatureDecodesFrame(t *testing.T) {
+func TestSpec_Subscribe_DeliversFrameBytes(t *testing.T) {
 	a := newArranger(t)
-	endpoint := a.WebhookEndpoint()
+	gateway := a.NotifyGateway()
 	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
 	frame := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02}
-	body, h := endpoint.SignedDelivery(defaultSecret, now, frame)
+	gateway.EnqueueFrame("camera", 0.42, now, frame)
+	gateway.EnqueueStreamEnded()
 
-	ev, err := endpoint.Parse(defaultSecret, h, body, now, WithTolerance(time.Minute))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := gateway.Subscribe(ctx, nil)
 	require.NoError(t, err)
-	assert.Equal(t, "stream-1", ev.StreamID)
-	assert.Equal(t, "camera", ev.Track)
-	assert.Equal(t, 0.42, ev.SSIMScore)
-	assert.Equal(t, frame, ev.Frame)
-	assert.True(t, ev.Timestamp.Equal(now))
+
+	frames := gateway.Frames()
+	require.Len(t, frames, 1)
+	assert.Equal(t, "stream-1", frames[0].StreamID)
+	assert.Equal(t, "camera", frames[0].Track)
+	assert.Equal(t, 0.42, frames[0].SSIMScore)
+	assert.Equal(t, "jpeg", frames[0].FrameFormat)
+	assert.Equal(t, frame, frames[0].Frame)
+	assert.True(t, frames[0].Timestamp.Equal(now))
 }
 
-func TestSpec_Webhook_RejectsForgedAndMissing(t *testing.T) {
-	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
-
-	cases := []struct {
-		name    string
-		mutate  func(body []byte, h http.Header) (secret string, outBody []byte, outHeader http.Header)
-		wantErr error
-	}{
-		{
-			name: "wrong secret",
-			mutate: func(b []byte, h http.Header) (string, []byte, http.Header) {
-				return "different-secret", b, h
-			},
-			wantErr: ErrInvalidSignature,
-		},
-		{
-			name: "tampered body",
-			mutate: func(b []byte, h http.Header) (string, []byte, http.Header) {
-				return defaultSecret, append(b, ' '), h
-			},
-			wantErr: ErrInvalidSignature,
-		},
-		{
-			name: "missing signature header",
-			mutate: func(b []byte, h http.Header) (string, []byte, http.Header) {
-				h.Del(WebhookSignatureHeader)
-				return defaultSecret, b, h
-			},
-			wantErr: ErrMissingSignature,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			a := newArranger(t)
-			endpoint := a.WebhookEndpoint()
-			body, h := endpoint.SignedDelivery(defaultSecret, now, []byte{0x01})
-			secret, body, h := tc.mutate(body, h)
-			_, err := endpoint.Parse(secret, h, body, now)
-			assert.ErrorIs(t, err, tc.wantErr)
-		})
-	}
-}
-
-func TestSpec_Webhook_RejectsStaleTimestamp(t *testing.T) {
+func TestSpec_Subscribe_AttachesTokenAndWatchParams(t *testing.T) {
 	a := newArranger(t)
-	endpoint := a.WebhookEndpoint()
-	signedAt := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
-	body, h := endpoint.SignedDelivery(defaultSecret, signedAt, []byte{0x01})
+	gateway := a.NotifyGateway()
+	gateway.EnqueueStreamEnded()
 
-	// Verify 10 minutes later with a 5-minute tolerance.
-	later := signedAt.Add(10 * time.Minute)
-	_, err := endpoint.Parse(defaultSecret, h, body, later, WithTolerance(5*time.Minute))
-	assert.ErrorIs(t, err, ErrStaleWebhook)
-}
-
-func TestSpec_Webhook_NoSecretSkipsVerification(t *testing.T) {
-	a := newArranger(t)
-	endpoint := a.WebhookEndpoint()
-	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
-	// An unsigned delivery with no signature headers at all.
-	body, _ := endpoint.SignedDelivery("", now, []byte{0x09})
-
-	ev, err := endpoint.Parse("", http.Header{}, body, now)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := gateway.Subscribe(ctx, &NotifyOptions{Track: "screen", Threshold: 0.9, PollIntervalMs: 1500})
 	require.NoError(t, err)
-	assert.Equal(t, []byte{0x09}, ev.Frame)
+
+	target := gateway.LastConnectTarget()
+	assert.Contains(t, target, "/notify")
+	assert.Contains(t, target, "token=read-jwt")
+	assert.Contains(t, target, "track=screen")
+	assert.Contains(t, target, "threshold=0.9")
+	assert.Contains(t, target, "poll_interval_ms=1500")
 }
 
-func TestSpec_Webhook_RejectsMalformedBody(t *testing.T) {
+func TestSpec_Subscribe_ReturnsWhenStreamEnds(t *testing.T) {
 	a := newArranger(t)
-	endpoint := a.WebhookEndpoint()
-	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
-	_, err := endpoint.Parse("", http.Header{}, []byte("not json"), now)
-	assert.ErrorIs(t, err, ErrMalformedWebhook)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := gateway.Subscribe(ctx, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "stream_ended", gateway.EndReason())
+}
+
+func TestSpec_Subscribe_ReturnsWhenSuperseded(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueSuperseded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := gateway.Subscribe(ctx, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "superseded", gateway.EndReason())
+}
+
+func TestSpec_Subscribe_SurfacesErrorMessage(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueError("token expired")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := gateway.Subscribe(ctx, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "token expired")
+}
+
+func TestSpec_Subscribe_ReportsTokenExpiring(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueTokenExpiring()
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := gateway.Subscribe(ctx, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, gateway.TokenExpiringCount())
+}
+
+func TestSpec_Subscribe_ReconnectsAfterEstablishedSocketDrops(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.DisconnectFirstConnectionAfter([]byte("before"), []byte("after"))
+	err := gateway.Subscribe(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, [][]byte{[]byte("before"), []byte("after")}, notifyFrameBytes(gateway.Frames()))
+	assert.Equal(t, 2, gateway.ConnectionCount())
+}
+
+func TestSpec_Subscribe_RejectsMismatchedStreamEnvelope(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueFrameForStream("another-stream", "camera", 0.5, time.Now(), []byte("frame"))
+	err := gateway.Subscribe(context.Background(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stream mismatch")
+	assert.Empty(t, gateway.Frames())
+}
+
+func TestSpec_Subscribe_SurfacesHandshakeStatusAndBody(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.RejectHandshake(http.StatusUnauthorized, "token revoked")
+	err := gateway.Subscribe(context.Background(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "401")
+	assert.Contains(t, err.Error(), "token revoked")
+}
+
+func TestSpec_Subscribe_UsesCustomTLSConfiguration(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.TLSNotifyGateway()
+	gateway.EnqueueStreamEnded()
+	err := gateway.Subscribe(context.Background(), nil)
+	require.NoError(t, err)
+}
+
+func TestSpec_Subscribe_ReturnsWhenContextCancelled(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	// No terminal message queued: the gateway holds the socket open, so Subscribe
+	// blocks on the read until the context is cancelled.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- gateway.Subscribe(ctx, nil) }()
+
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Subscribe did not return after context cancellation")
+	}
+}
+
+// A subscription that ends on its own — without the caller cancelling the
+// context — must not leak the socket-closing watcher goroutine. This is the
+// common case: the camera demo passes context.Background(), which is never
+// cancelled, so a leaked watcher per completed subscription would accumulate
+// indefinitely.
+func TestSpec_Subscribe_DoesNotLeakGoroutineWhenStreamEnds(t *testing.T) {
+	a := newArranger(t)
+	// A single gateway (one httptest server) reused across every run, so the only
+	// thing that could grow with the run count is the client's own watcher
+	// goroutine — not per-gateway harness goroutines.
+	gateway := a.NotifyGateway()
+	gateway.EnqueueStreamEnded()
+
+	// Run many self-ending subscriptions against a never-cancelled context (the
+	// camera demo's exact usage). If the watcher goroutine were tied only to the
+	// caller's context, each completed subscription would strand one goroutine on
+	// <-ctx.Done().
+	const runs = 50
+	before := goroutineCount()
+	for range runs {
+		require.NoError(t, gateway.Subscribe(context.Background(), nil))
+	}
+
+	// Allow the (correctly cancelled) watchers to unwind, then assert the count
+	// settled back near the baseline rather than growing by ~runs.
+	if !eventually(2*time.Second, func() bool {
+		return goroutineCount() <= before+5
+	}) {
+		t.Fatalf("goroutine count grew from %d to %d across %d completed subscriptions: watcher goroutine leaked", before, goroutineCount(), runs)
+	}
+}
+
+func notifyFrameBytes(events []NotifyEvent) [][]byte {
+	frames := make([][]byte, len(events))
+	for i, event := range events {
+		frames[i] = event.Frame
+	}
+	return frames
 }

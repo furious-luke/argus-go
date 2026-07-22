@@ -1,14 +1,15 @@
 # Argus Go Client
 
-A small, dependency-free Go client for the Argus video streaming platform. It runs on a customer's own backend and wraps the three things a
-server-side integration needs:
+A small Go client for the Argus video streaming platform. It runs on a
+customer's own backend and wraps the three things a server-side integration
+needs:
 
 - **Mint join tokens** for new streams, to hand to an end user's browser.
 - **Fetch decoded frames** from a regional frame gateway.
-- **Verify and decode change-trigger webhooks** delivered by Argus.
+- **Subscribe to change notifications** over a regional gateway WebSocket.
 
-The package imports only the Go standard library, so it can be vendored or
-dropped into an external application without pulling in the rest of Argus.
+The package uses the Go standard library plus `gorilla/websocket` for notification
+subscriptions, without pulling in the rest of Argus.
 
 ## Background
 
@@ -40,20 +41,25 @@ import argus "github.com/furious-luke/argus-go"
 ```
 
 The module path is `github.com/furious-luke/argus-go`; the package it exports is
-named `argus`, so call sites read `argus.New(...)`, `argus.ParseWebhook(...)`,
-and so on.
+named `argus`, so call sites read `argus.New(...)`, `argus.FetchFrame(...)`, and
+`c.Subscribe(...)`.
 
 ## Authentication
 
-Two distinct credentials are in play; don't confuse them:
+Three distinct credentials are in play; don't confuse them:
 
 | Credential | Lifetime | Holder | Used for |
 | --- | --- | --- | --- |
 | **API key** | Long-lived, secret | Customer server (this library) | Minting join tokens; sent as `Authorization: ApiKey <key>` |
-| **Read token** | Short-lived JWT | Browser, and the customer server for reads | Scoped to one stream; sent as `Authorization: Bearer <token>` when fetching frames |
+| **Join token** | Short-lived JWT | Browser | Publishing one stream through signaling |
+| **Read token** | ~1-hour JWT | Browser, then customer server | Fetching frames and subscribing to change notifications for one stream in the selected region |
 
-The read token is returned in `JoinResponse.Token`. Keep your API key on the
-server; never ship it to a browser.
+`JoinResponse.Token` is the publishing join token, not the read token. The
+gateway returns the read token to the browser during signaling. Relay that value
+and `publisher.selectedGatewayURL` back to the customer server for frame reads
+and notification subscriptions. The pair must stay together because the read
+token is region-scoped. Keep your API key on the server; never ship it to a
+browser.
 
 ## Usage
 
@@ -63,12 +69,15 @@ server; never ship it to a browser.
 c := argus.New("https://argus.example.com", "argus_api_key_...")
 ```
 
-`New` applies a 30s request timeout. To control the transport, timeouts, or TLS,
-pass your own `*http.Client`:
+`New` applies a 30s request timeout. To control the transport, timeouts, proxy,
+or TLS, pass your own `*http.Client`:
 
 ```go
 c := argus.NewWithHTTPClient(baseURL, apiKey, &http.Client{Timeout: time.Minute})
 ```
+
+When that client uses a standard `*http.Transport`, its proxy, dial, TLS, and
+cookie-jar settings are also applied to `Subscribe`'s WebSocket handshake.
 
 ### Mint a join token
 
@@ -81,22 +90,16 @@ if err != nil {
 // Keep join.StreamID for later reads.
 ```
 
-To pin a region or configure a change-trigger webhook, use
-`JoinStreamWithOptions`:
+To pin a region, use `JoinStreamWithOptions`:
 
 ```go
-threshold := 0.85
 join, err := c.JoinStreamWithOptions(ctx, &argus.JoinOptions{
     Region: "eu-west-1", // optional; omit to let Argus choose
-    Trigger: &argus.TriggerConfig{
-        WebhookURL: "https://my-app.example.com/argus/webhook",
-        Threshold:  &threshold, // optional change-detection threshold in (0,1]
-        Track:      "camera",   // optional; "camera" or "screen"
-    },
 })
-// When a Trigger is configured, join.WebhookSecret holds the signing secret —
-// store it to verify webhook deliveries (see below).
 ```
+
+Change-detection parameters are supplied to `Subscribe`, so they are
+per-subscription and can change without recreating the stream.
 
 Region selection is subject to the account's data-residency policy. A requested
 region that violates the policy is rejected, surfaced here as an error.
@@ -104,12 +107,17 @@ region that violates the policy is rejected, surfaced here as an error.
 ### Fetch a frame
 
 ```go
-frame, err := c.FetchFrame(ctx, join.GatewayURLs[0], join.StreamID, join.Token, nil)
+// readToken and selectedGatewayURL were relayed after browser signaling.
+frame, err := c.FetchFrame(ctx, selectedGatewayURL, join.StreamID, readToken, nil)
 if err != nil {
     return err
 }
 // frame is JPEG bytes by default.
 ```
+
+`FetchFrame` accepts the raw `ws://`/`wss://…/signal` URL selected by argus-js
+and normalizes it to the gateway's HTTP frame endpoint. An already-normalized
+`http://`/`https://` gateway base URL also works.
 
 Override the track, format, or per-request timeout with `FrameOptions`:
 
@@ -130,68 +138,56 @@ If the stream is still stalled after five attempts, it returns a
 `FrameAge` when you need to distinguish this state from other failures. Raw HTTP
 callers can inspect `X-Argus-Frame-Age-Ms` and `Retry-After` on stale responses.
 
-### Receive change-trigger webhooks
+### Subscribe to change notifications
 
-When a stream is created with a `Trigger`, Argus watches its video and POSTs an
-event to your `WebhookURL` whenever the picture changes. Verify and decode each
-delivery with `ParseWebhook`, passing the secret from `JoinResponse.WebhookSecret`:
+Your server opens one WebSocket per stream to its regional frame gateway. The
+connection is the subscription: the current frame arrives immediately, followed
+by frames for material scene changes. `Subscribe` blocks for the connection's
+lifetime, so run it in a goroutine.
+
+After the initial connection succeeds, an unexpected socket loss is reconnected
+automatically on the same customer node with bounded backoff. Context cancellation,
+`stream_ended`, `superseded`, protocol errors, and explicit gateway rejections remain
+terminal.
 
 ```go
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-    body, err := io.ReadAll(r.Body) // pass the EXACT bytes received
-    if err != nil {
-        http.Error(w, "read body", http.StatusBadRequest)
-        return
-    }
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
 
-    secret := h.secretForStream(/* look up by stream */) // your storage
-    ev, err := argus.ParseWebhook(secret, r.Header, body)
-    switch {
-    case errors.Is(err, argus.ErrInvalidSignature),
-        errors.Is(err, argus.ErrMissingSignature),
-        errors.Is(err, argus.ErrStaleWebhook):
-        http.Error(w, "unauthorized", http.StatusUnauthorized)
-        return
-    case errors.Is(err, argus.ErrMalformedWebhook):
-        http.Error(w, "bad request", http.StatusBadRequest)
-        return
-    case err != nil:
-        http.Error(w, "error", http.StatusInternalServerError)
-        return
+go func() {
+    err := c.Subscribe(ctx, selectedGatewayURL, streamID, readToken,
+        &argus.NotifyOptions{
+            Track:          "camera",
+            Threshold:      0.85,
+            PollIntervalMs: 500,
+        },
+        argus.NotifyHandlers{
+            OnFrame: func(ev argus.NotifyEvent) {
+                // ev.StreamID, ev.Track, ev.SSIMScore, ev.FrameFormat, ev.Frame ...
+            },
+            OnTokenExpiring: func() {
+                // Prepare for this subscription to end at token expiry. In-place
+                // read-token renewal is planned separately.
+            },
+            OnEnded: func(reason string) {
+                // reason is "stream_ended" or "superseded".
+            },
+        })
+    if err != nil && !errors.Is(err, context.Canceled) {
+        log.Printf("notify subscription failed: %v", err)
     }
-
-    // ev.StreamID, ev.Track, ev.SSIMScore, ev.Frame ...
-    w.WriteHeader(http.StatusOK)
-}
+}()
 ```
 
-If you need the stream ID *before* you can look up its secret, call
-`ParseWebhook("", header, body)` first to decode without verifying, then call it
-again with the resolved secret to verify for real.
-
-**Signature scheme.** Argus signs `"<X-Argus-Timestamp>.<body>"` with
-HMAC-SHA256 and sends the result as `X-Argus-Signature: sha256=<hexdigest>`,
-alongside `X-Argus-Timestamp`. `ParseWebhook` recomputes and compares it in
-constant time, then rejects deliveries whose timestamp is outside a tolerance
-window (5 minutes by default) to prevent replay. Tune it with `WithTolerance`;
-pass a non-positive duration to disable the staleness check.
-
-Because verification is over the raw bytes, **do not re-marshal the body before
-verifying** — that invalidates the signature.
+`NotifyOptions` fields are optional; zero values use server defaults.
+`NotifyEvent.Frame` contains decoded image bytes. A newer subscription for the
+same stream supersedes the older one, which receives `OnEnded("superseded")`.
 
 ## Errors
 
-`ParseWebhook` returns sentinel errors you can match with `errors.Is`:
-
-| Error | Meaning | Suggested response |
-| --- | --- | --- |
-| `ErrMissingSignature` | A secret was supplied but the request had no signature header | `401` |
-| `ErrInvalidSignature` | The signature did not match the body | `401` |
-| `ErrStaleWebhook` | The signed timestamp is outside the tolerance window | `401` |
-| `ErrMalformedWebhook` | The body could not be parsed | `400` |
-
-`JoinStream*` and `FetchFrame` return a wrapped error whose message includes the
-HTTP status and response body on a non-success response.
+`JoinStream*`, `FetchFrame`, and `Subscribe` return wrapped errors. Frame and
+stream creation errors include the HTTP status and response body when applicable.
+Cancellation of a live subscription returns the context error.
 
 ## Files
 
@@ -200,7 +196,7 @@ HTTP status and response body on a non-success response.
 | `client.go` | `Client`, `New`, `NewWithHTTPClient`, package docs |
 | `stream.go` | `JoinStream` / `JoinStreamWithOptions` and their types |
 | `frame.go` | `FetchFrame` and `FrameOptions` |
-| `webhook.go` | `ParseWebhook`, `WebhookEvent`, sentinel errors |
+| `notify.go` | `Subscribe`, `NotifyEvent`, `NotifyOptions`, `NotifyHandlers` |
 
 ## Testing
 
