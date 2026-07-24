@@ -67,7 +67,7 @@ func TestSpec_Frame_DefaultsTrackAndFormat(t *testing.T) {
 func TestSpec_Frame_HonoursTrackAndFormat(t *testing.T) {
 	a := newArranger(t)
 	server := a.CustomerServer()
-	server.MustFetchFrame("stream-1", "read-jwt", &FrameOptions{Track: "screen", Format: "png"})
+	server.MustFetchFrame("stream-1", "read-jwt", &FrameOptions{Track: TrackScreen, Format: "png"})
 	target, _ := server.LastFrameRequest()
 	assert.Contains(t, target, "track=screen")
 	assert.Contains(t, target, "format=png")
@@ -168,7 +168,7 @@ func TestSpec_Subscribe_AttachesTokenAndWatchParams(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	err := gateway.Subscribe(ctx, &NotifyOptions{Track: "screen", Threshold: 0.9, PollIntervalMs: 1500})
+	err := gateway.Subscribe(ctx, &NotifyOptions{Track: TrackScreen, Threshold: 0.9, PollIntervalMs: 1500})
 	require.NoError(t, err)
 
 	target := gateway.LastConnectTarget()

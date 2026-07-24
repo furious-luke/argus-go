@@ -20,8 +20,8 @@ import (
 type NotifyEvent struct {
 	// StreamID is the UUID of the stream the event concerns.
 	StreamID string
-	// Track is the logical track that changed ("camera" or "screen").
-	Track string
+	// Track is the logical track that changed: TrackCamera or TrackScreen.
+	Track TrackType
 	// SSIMScore is the structural-similarity score against the previous baseline
 	// frame; lower means a larger change. It is zero for the initial on-subscribe
 	// frame.
@@ -37,8 +37,9 @@ type NotifyEvent struct {
 // NotifyOptions configures a Subscribe call. Zero-valued fields use the server
 // default.
 type NotifyOptions struct {
-	// Track selects which track to watch ("camera" or "screen").
-	Track string
+	// Track selects which track to watch: TrackCamera or TrackScreen (default
+	// TrackCamera).
+	Track TrackType
 	// Threshold is the change-detection threshold in (0,1].
 	Threshold float64
 	// PollIntervalMs is the watcher poll interval in milliseconds (>0).

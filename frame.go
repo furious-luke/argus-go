@@ -45,9 +45,9 @@ func (e *StaleFrameError) Unwrap() error { return ErrStaleFrame }
 // FrameOptions configures a FetchFrame request. A nil *FrameOptions uses the
 // defaults documented on each field.
 type FrameOptions struct {
-	// Track is the logical track to read, "camera" or "screen" (default
-	// "camera").
-	Track string
+	// Track is the logical track to read: TrackCamera or TrackScreen (default
+	// TrackCamera).
+	Track TrackType
 	// Format is the output image format, "jpeg" or "png" (default "jpeg").
 	Format string
 	// Timeout is the HTTP timeout for this request (default 10s). It overrides
@@ -77,7 +77,7 @@ func (c *Client) FetchFrame(ctx context.Context, gatewayURL, streamID, readToken
 	}
 	track := opts.Track
 	if track == "" {
-		track = "camera"
+		track = TrackCamera
 	}
 	format := opts.Format
 	if format == "" {
