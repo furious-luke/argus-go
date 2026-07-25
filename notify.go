@@ -47,9 +47,32 @@ type NotifyOptions struct {
 }
 
 // NotifyHandlers receive events over a subscription's lifetime. All are optional.
+//
+// The transcription handlers fire when the stream publishes a microphone track.
+// They arrive on the same subscription as frames; a transcript-only consumer
+// (e.g. a voice agent that does not need video) simply leaves OnFrame nil and
+// omits the frame watch options.
 type NotifyHandlers struct {
 	// OnFrame is called for each frame (initial and subsequent changes).
 	OnFrame func(NotifyEvent)
+	// OnSpeechStarted fires when the speaker begins talking. A voice agent uses
+	// it to stop talking and yield the turn.
+	OnSpeechStarted func()
+	// OnTranscript fires with a complete utterance. Only final transcripts are
+	// delivered — interim/partial text is never sent.
+	OnTranscript func(text string)
+	// OnNoSpeech fires when an utterance produced no usable text (silence, noise,
+	// unintelligible audio), so a voice agent can resume speaking.
+	OnNoSpeech func()
+	// OnTranscriptionInterrupted fires on a RECOVERABLE transcription break: the
+	// active provider dropped/recovered, or active microphone input ended without
+	// completing its endpoint. The consumer should ask the speaker to repeat when
+	// transcription input is available again.
+	OnTranscriptionInterrupted func()
+	// OnTranscriptionUnavailable fires on a TERMINAL transcription break: every
+	// provider failed and transcription will not resume for this stream. Frames
+	// (if any) are unaffected.
+	OnTranscriptionUnavailable func()
 	// OnTokenExpiring fires when the read token is near expiry. The current client
 	// does not support replacing the token in place; the subscription ends when
 	// the gateway drops the expired connection.
@@ -76,7 +99,7 @@ type NotifyHandlers struct {
 // one notify socket per stream, and it lands on whichever node the browser
 // reported the read token to — no cross-node fan-out is required.
 func (c *Client) Subscribe(ctx context.Context, gatewayURL, streamID, readToken string, opts *NotifyOptions, handlers NotifyHandlers) error {
-	wsURL, err := notifyWSURL(gatewayURL, readToken, opts)
+	wsURL, err := notifyWSURL(gatewayURL, readToken, opts, handlers.OnFrame != nil)
 	if err != nil {
 		return err
 	}
@@ -170,6 +193,26 @@ func readNotifyConnection(ctx context.Context, conn *websocket.Conn, streamID st
 				FrameFormat: msg.FrameFormat,
 				Frame:       frame,
 			})
+		case notifyMsgSpeechStarted:
+			if handlers.OnSpeechStarted != nil {
+				handlers.OnSpeechStarted()
+			}
+		case notifyMsgTranscript:
+			if handlers.OnTranscript != nil {
+				handlers.OnTranscript(msg.Text)
+			}
+		case notifyMsgNoSpeech:
+			if handlers.OnNoSpeech != nil {
+				handlers.OnNoSpeech()
+			}
+		case notifyMsgTranscriptionInterrupted:
+			if handlers.OnTranscriptionInterrupted != nil {
+				handlers.OnTranscriptionInterrupted()
+			}
+		case notifyMsgTranscriptionUnavailable:
+			if handlers.OnTranscriptionUnavailable != nil {
+				handlers.OnTranscriptionUnavailable()
+			}
 		case notifyMsgTokenExpiring:
 			if handlers.OnTokenExpiring != nil {
 				handlers.OnTokenExpiring()
@@ -224,20 +267,26 @@ type notifyWire struct {
 	FrameFormat string  `json:"frame_format,omitempty"`
 	FrameBase64 string  `json:"frame_base64,omitempty"`
 	Timestamp   string  `json:"timestamp,omitempty"`
+	Text        string  `json:"text,omitempty"`
 	Reason      string  `json:"reason,omitempty"`
 }
 
 const (
-	notifyMsgFrame         = "frame"
-	notifyMsgSuperseded    = "superseded"
-	notifyMsgStreamEnded   = "stream_ended"
-	notifyMsgTokenExpiring = "token_expiring"
-	notifyMsgError         = "error"
+	notifyMsgFrame                    = "frame"
+	notifyMsgSuperseded               = "superseded"
+	notifyMsgStreamEnded              = "stream_ended"
+	notifyMsgTokenExpiring            = "token_expiring"
+	notifyMsgError                    = "error"
+	notifyMsgSpeechStarted            = "speech_started"
+	notifyMsgTranscript               = "transcript"
+	notifyMsgNoSpeech                 = "no_speech"
+	notifyMsgTranscriptionInterrupted = "transcription_interrupted"
+	notifyMsgTranscriptionUnavailable = "transcription_unavailable"
 )
 
 // notifyWSURL builds the gateway /notify WebSocket URL, normalizing http(s) to
 // ws(s) and attaching the token and watch parameters as query values.
-func notifyWSURL(gatewayURL, readToken string, opts *NotifyOptions) (string, error) {
+func notifyWSURL(gatewayURL, readToken string, opts *NotifyOptions, watchFrames bool) (string, error) {
 	u, err := gatewayBaseURL(gatewayURL, gatewayWebSocket)
 	if err != nil {
 		return "", err
@@ -246,6 +295,9 @@ func notifyWSURL(gatewayURL, readToken string, opts *NotifyOptions) (string, err
 
 	q := url.Values{}
 	q.Set("token", readToken)
+	if !watchFrames {
+		q.Set("watch_frames", "false")
+	}
 	if opts != nil {
 		if opts.Track != "" {
 			q.Set("track", opts.Track)

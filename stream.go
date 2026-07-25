@@ -35,11 +35,20 @@ type JoinOptions struct {
 	// Region pins the stream to a specific region slug. Empty lets the control
 	// plane select an eligible region (subject to data-residency policy).
 	Region string
+	// Language is an initial language / BCP-47 hint for transcription, applied if
+	// the stream publishes a microphone track. Empty defers to provider defaults.
+	// It is stored server-side on the stream and never exposed to the browser.
+	Language string
+	// Keyterms boost recognition of domain vocabulary during transcription.
+	// Server-side only, like Language.
+	Keyterms []string
 }
 
 // joinStreamBody mirrors the control plane's createStreamRequest JSON shape.
 type joinStreamBody struct {
-	Region string `json:"region,omitempty"`
+	Region   string   `json:"region,omitempty"`
+	Language string   `json:"language,omitempty"`
+	Keyterms []string `json:"keyterms,omitempty"`
 }
 
 // JoinStream creates a new stream with default options and returns its join
@@ -54,6 +63,8 @@ func (c *Client) JoinStreamWithOptions(ctx context.Context, opts *JoinOptions) (
 	var body joinStreamBody
 	if opts != nil {
 		body.Region = opts.Region
+		body.Language = opts.Language
+		body.Keyterms = opts.Keyterms
 	}
 
 	payload, err := json.Marshal(body)

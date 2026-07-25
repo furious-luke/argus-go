@@ -245,6 +245,14 @@ func (a *NotifyGatewayActor) Subscribe(ctx context.Context, opts *NotifyOptions)
 	return a.client.Subscribe(ctx, a.gatewayURL, "stream-1", "read-jwt", opts, a.handlers())
 }
 
+// SubscribeTranscriptsOnly leaves the frame callback absent, which is the
+// public client contract for suppressing video watcher work.
+func (a *NotifyGatewayActor) SubscribeTranscriptsOnly(ctx context.Context) error {
+	return a.client.Subscribe(ctx, a.gatewayURL, "stream-1", "read-jwt", nil, NotifyHandlers{
+		OnTranscript: func(string) {},
+	})
+}
+
 // Frames returns the frames the subscription delivered, in order.
 func (a *NotifyGatewayActor) Frames() []NotifyEvent {
 	a.mu.Lock()

@@ -21,7 +21,7 @@ func TestNotifyWSURL_NormalizesScheme(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			raw, err := notifyWSURL(tc.gatewayURL, "read-jwt", nil)
+			raw, err := notifyWSURL(tc.gatewayURL, "read-jwt", nil, true)
 			require.NoError(t, err)
 			u, err := url.Parse(raw)
 			require.NoError(t, err)
@@ -32,7 +32,7 @@ func TestNotifyWSURL_NormalizesScheme(t *testing.T) {
 }
 
 func TestNotifyWSURL_RejectsUnsupportedScheme(t *testing.T) {
-	_, err := notifyWSURL("ftp://gw.example.com", "read-jwt", nil)
+	_, err := notifyWSURL("ftp://gw.example.com", "read-jwt", nil, true)
 	require.Error(t, err)
 }
 
@@ -41,7 +41,7 @@ func TestNotifyWSURL_AttachesTokenAndWatchParams(t *testing.T) {
 		Track:          "screen",
 		Threshold:      0.9,
 		PollIntervalMs: 1500,
-	})
+	}, true)
 	require.NoError(t, err)
 
 	u, err := url.Parse(raw)
@@ -54,7 +54,7 @@ func TestNotifyWSURL_AttachesTokenAndWatchParams(t *testing.T) {
 }
 
 func TestNotifyWSURL_OmitsUnsetWatchParams(t *testing.T) {
-	raw, err := notifyWSURL("https://gw.example.com", "read-jwt", nil)
+	raw, err := notifyWSURL("https://gw.example.com", "read-jwt", nil, true)
 	require.NoError(t, err)
 
 	u, err := url.Parse(raw)

@@ -179,6 +179,20 @@ func TestSpec_Subscribe_AttachesTokenAndWatchParams(t *testing.T) {
 	assert.Contains(t, target, "poll_interval_ms=1500")
 }
 
+// A transcript-only customer owns the notify subscription but explicitly tells
+// the server not to allocate its video watcher.
+func TestSpec_Subscribe_OmitsVideoWorkWithoutFrameHandler(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, gateway.SubscribeTranscriptsOnly(ctx))
+
+	assert.Contains(t, gateway.LastConnectTarget(), "watch_frames=false")
+}
+
 func TestSpec_Subscribe_ReturnsWhenStreamEnds(t *testing.T) {
 	a := newArranger(t)
 	gateway := a.NotifyGateway()
