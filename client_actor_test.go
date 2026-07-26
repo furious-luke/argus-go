@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"runtime"
 	"strconv"
@@ -146,6 +147,82 @@ type NotifyGatewayActor struct {
 	expiring  int
 }
 
+// deadlineWriteTrackingConn wraps the real TCP connection beneath Gorilla and
+// records whether cancellation mutates a deadline while a WebSocket write owns
+// the transport. It blocks only after Arm, so the HTTP upgrade is unaffected.
+type deadlineWriteTrackingConn struct {
+	net.Conn
+	mu                 sync.Mutex
+	armed              bool
+	writing            bool
+	concurrentDeadline bool
+	writeEntered       chan struct{}
+	releaseWrite       chan struct{}
+	deadlineObserved   chan struct{}
+	closeObserved      chan struct{}
+	writeOnce          sync.Once
+	deadlineOnce       sync.Once
+	closeOnce          sync.Once
+}
+
+func newDeadlineWriteTrackingConn(conn net.Conn) *deadlineWriteTrackingConn {
+	return &deadlineWriteTrackingConn{
+		Conn: conn, writeEntered: make(chan struct{}), releaseWrite: make(chan struct{}),
+		deadlineObserved: make(chan struct{}), closeObserved: make(chan struct{}),
+	}
+}
+
+func (c *deadlineWriteTrackingConn) Arm() {
+	c.mu.Lock()
+	c.armed = true
+	c.mu.Unlock()
+}
+
+func (c *deadlineWriteTrackingConn) Write(payload []byte) (int, error) {
+	c.mu.Lock()
+	armed := c.armed
+	if armed {
+		c.writing = true
+		c.writeOnce.Do(func() { close(c.writeEntered) })
+	}
+	c.mu.Unlock()
+	if armed {
+		<-c.releaseWrite
+	}
+	written, err := c.Conn.Write(payload)
+	c.mu.Lock()
+	c.writing = false
+	c.mu.Unlock()
+	return written, err
+}
+
+func (c *deadlineWriteTrackingConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	concurrent := c.armed && c.writing
+	if concurrent {
+		c.concurrentDeadline = true
+		c.deadlineOnce.Do(func() { close(c.deadlineObserved) })
+	}
+	c.mu.Unlock()
+	return c.Conn.SetWriteDeadline(deadline)
+}
+
+func (c *deadlineWriteTrackingConn) Close() error {
+	c.mu.Lock()
+	armed := c.armed
+	c.mu.Unlock()
+	if armed {
+		c.closeOnce.Do(func() { close(c.closeObserved) })
+	}
+	return c.Conn.Close()
+}
+
+func (c *deadlineWriteTrackingConn) HadConcurrentDeadline() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.concurrentDeadline
+}
+
 // EnqueueFrame queues a frame message the gateway pushes on connect.
 func (a *NotifyGatewayActor) EnqueueFrame(track string, ssim float64, ts time.Time, frame []byte) {
 	a.EnqueueFrameForStream("stream-1", track, ssim, ts, frame)
@@ -242,13 +319,13 @@ func (a *NotifyGatewayActor) handlers() NotifyHandlers {
 // Subscribe runs Client.Subscribe against the fake gateway and returns its error
 // for the spec to assert on.
 func (a *NotifyGatewayActor) Subscribe(ctx context.Context, opts *NotifyOptions) error {
-	return a.client.Subscribe(ctx, a.gatewayURL, "stream-1", "read-jwt", opts, a.handlers())
+	return a.client.Subscribe(ctx, a.gatewayURL, "stream-1", "control-jwt", opts, a.handlers())
 }
 
 // SubscribeTranscriptsOnly leaves the frame callback absent, which is the
 // public client contract for suppressing video watcher work.
 func (a *NotifyGatewayActor) SubscribeTranscriptsOnly(ctx context.Context) error {
-	return a.client.Subscribe(ctx, a.gatewayURL, "stream-1", "read-jwt", nil, NotifyHandlers{
+	return a.client.Subscribe(ctx, a.gatewayURL, "stream-1", "control-jwt", nil, NotifyHandlers{
 		OnTranscript: func(string) {},
 	})
 }
@@ -280,8 +357,118 @@ func (a *NotifyGatewayActor) LastConnectTarget() string {
 	return a.gateway.connectTarget()
 }
 
+func (a *NotifyGatewayActor) LastAuthorization() string {
+	return a.gateway.authorization()
+}
+
 func (a *NotifyGatewayActor) ConnectionCount() int {
 	return a.gateway.connectionCount()
+}
+
+func (a *NotifyGatewayActor) StreamUtterance(ctx context.Context, id string, chunks ...string) []notifyWire {
+	a.t.Helper()
+	subscription, err := a.client.OpenNotify(ctx, a.gatewayURL, "stream-1", "control-jwt", nil, NotifyHandlers{})
+	require.NoError(a.t, err)
+	require.NoError(a.t, subscription.StartUtterance(id))
+	for _, chunk := range chunks {
+		require.NoError(a.t, subscription.SendUtteranceText(id, chunk))
+	}
+	require.NoError(a.t, subscription.EndUtterance(id))
+	want := len(chunks) + 2
+	for range 100 {
+		if len(a.gateway.receivedMessages()) >= want {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_ = subscription.Close()
+	return a.gateway.receivedMessages()
+}
+
+func (a *NotifyGatewayActor) StalledCommandReturnsWithinBound() bool {
+	a.t.Helper()
+	a.gateway.stallCommandReads()
+	subscription, err := a.client.OpenNotify(context.Background(), a.gatewayURL, "stream-1", "control-jwt", nil, NotifyHandlers{})
+	require.NoError(a.t, err)
+	done := make(chan time.Duration, 1)
+	started := time.Now()
+	go func() {
+		payload := strings.Repeat("x", 4<<10)
+		for {
+			if err := subscription.SendUtteranceText("u-stalled", payload); err != nil {
+				done <- time.Since(started)
+				return
+			}
+		}
+	}()
+	select {
+	case elapsed := <-done:
+		_ = subscription.Close()
+		return elapsed < 1250*time.Millisecond
+	case <-time.After(1500 * time.Millisecond):
+		_ = subscription.Close()
+		<-done
+		return false
+	}
+}
+
+// CancellationKeepsSingleWriter blocks one real WebSocket write, cancels its
+// operation, and reports whether interruption avoided a concurrent deadline
+// mutation. Either a deadline mutation or socket close provides the barrier.
+func (a *NotifyGatewayActor) CancellationKeepsSingleWriter() bool {
+	a.t.Helper()
+	tracked := make(chan *deadlineWriteTrackingConn, 1)
+	dialer := *websocket.DefaultDialer
+	dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		wrapped := newDeadlineWriteTrackingConn(conn)
+		tracked <- wrapped
+		return wrapped, nil
+	}
+	conn, _, err := dialer.Dial(strings.Replace(a.gatewayURL, "http://", "ws://", 1)+"/notify", nil)
+	require.NoError(a.t, err)
+	transport := <-tracked
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelProcessed := make(chan struct{})
+	subscription := &NotifySubscription{
+		conn: conn, ctx: ctx, done: make(chan struct{}),
+		afterWriteCancel: func() { close(cancelProcessed) },
+	}
+	transport.Arm()
+
+	sendDone := make(chan struct{})
+	go func() {
+		_ = subscription.StartUtterance("blocked")
+		close(sendDone)
+	}()
+	select {
+	case <-transport.writeEntered:
+	case <-time.After(time.Second):
+		a.t.Fatal("command did not enter the transport write")
+	}
+	cancel()
+	select {
+	case <-cancelProcessed:
+	case <-time.After(time.Second):
+		a.t.Fatal("write cancellation callback did not finish")
+	}
+	closedForCancellation := false
+	select {
+	case <-transport.closeObserved:
+		closedForCancellation = true
+	default:
+	}
+	close(transport.releaseWrite)
+	select {
+	case <-sendDone:
+	case <-time.After(time.Second):
+		a.t.Fatal("cancelled command did not return")
+	}
+	_ = conn.Close()
+	return closedForCancellation && !transport.HadConcurrentDeadline()
 }
 
 // --- fakes ------------------------------------------------------------------
@@ -299,7 +486,8 @@ func newFakeControlPlane() *fakeControlPlane {
 	return &fakeControlPlane{
 		status: http.StatusCreated,
 		body: `{"token":"join-jwt","stream_id":"stream-1",` +
-			`"expires_at":"2026-06-30T13:00:00Z","gateway_urls":["https://gw.example.com"]}`,
+			`"expires_at":"2026-06-30T13:00:00Z","gateway_urls":["https://gw.example.com"],` +
+			`"control_token":"control-jwt","control_token_expires_at":"2026-06-30T14:00:00Z"}`,
 	}
 }
 
@@ -373,7 +561,16 @@ type fakeNotifyGateway struct {
 
 	mu          sync.Mutex
 	target      string
+	auth        string
 	connections int
+	received    []notifyWire
+	stallReads  bool
+}
+
+func (f *fakeNotifyGateway) stallCommandReads() {
+	f.mu.Lock()
+	f.stallReads = true
+	f.mu.Unlock()
 }
 
 func newFakeNotifyGateway() *fakeNotifyGateway {
@@ -411,9 +608,22 @@ func (f *fakeNotifyGateway) connectionCount() int {
 	return f.connections
 }
 
+func (f *fakeNotifyGateway) authorization() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.auth
+}
+
+func (f *fakeNotifyGateway) receivedMessages() []notifyWire {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]notifyWire(nil), f.received...)
+}
+
 func (f *fakeNotifyGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.target = r.URL.RequestURI()
+	f.auth = r.Header.Get("Authorization")
 	if f.status != 0 {
 		status, body := f.status, f.body
 		f.mu.Unlock()
@@ -422,6 +632,7 @@ func (f *fakeNotifyGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	connection := f.connections
 	f.connections++
+	stallReads := f.stallReads
 	messages := append([]notifyWire(nil), f.messages...)
 	scripted := len(f.scripts) > 0
 	if scripted {
@@ -444,13 +655,21 @@ func (f *fakeNotifyGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if scripted {
 		return
 	}
+	if stallReads {
+		<-r.Context().Done()
+		return
+	}
 
 	// Keep the socket open until the client closes it (e.g. on context cancel or
 	// after a terminal message). ReadMessage returns once the peer goes away.
 	for {
-		if _, _, err := conn.ReadMessage(); err != nil {
+		var message notifyWire
+		if err := conn.ReadJSON(&message); err != nil {
 			return
 		}
+		f.mu.Lock()
+		f.received = append(f.received, message)
+		f.mu.Unlock()
 	}
 }
 

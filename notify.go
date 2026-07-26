@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -73,7 +74,13 @@ type NotifyHandlers struct {
 	// provider failed and transcription will not resume for this stream. Frames
 	// (if any) are unaffected.
 	OnTranscriptionUnavailable func()
-	// OnTokenExpiring fires when the read token is near expiry. The current client
+	// OnUtterance receives state changes for assistant speech submitted on this
+	// same bidirectional socket.
+	OnUtterance func(UtteranceEvent)
+	// OnUserText receives valid typed browser input after Argus has cancelled any
+	// speech it interrupted.
+	OnUserText func(messageID, text string)
+	// OnTokenExpiring fires when the control token is near expiry. The current client
 	// does not support replacing the token in place; the subscription ends when
 	// the gateway drops the expired connection.
 	OnTokenExpiring func()
@@ -81,6 +88,98 @@ type NotifyHandlers struct {
 	// newer one (e.g. the browser reconnected to a different node). After it
 	// fires, Subscribe returns.
 	OnEnded func(reason string)
+}
+
+type UtteranceEvent struct {
+	Type         string
+	UtteranceID  string
+	Reason       string
+	DeliveryMode string
+	TextComplete bool
+}
+
+type NotifySubscription struct {
+	conn      *websocket.Conn
+	ctx       context.Context
+	writeMu   sync.Mutex
+	done      chan struct{}
+	errMu     sync.Mutex
+	err       error
+	closeOnce sync.Once
+	// afterWriteCancel is a test-only completion barrier for the cancellation
+	// callback installed around a blocked write. Nil in production.
+	afterWriteCancel func()
+}
+
+const notifyWriteTimeout = time.Second
+
+func (s *NotifySubscription) Done() <-chan struct{} { return s.done }
+
+func (s *NotifySubscription) Err() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.err
+}
+
+func (s *NotifySubscription) send(message notifyWire) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(notifyWriteTimeout)
+	if ctxDeadline, ok := s.ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := s.conn.SetWriteDeadline(deadline); err != nil {
+		_ = s.Close()
+		return err
+	}
+	cancelled := make(chan struct{})
+	stopCancel := context.AfterFunc(s.ctx, func() {
+		// gorilla/websocket permits Close concurrently with the sole writer. A
+		// deadline mutation is itself a write-side transport operation and can race
+		// WriteJSON, so cancellation aborts the captured socket instead.
+		_ = s.conn.Close()
+		if s.afterWriteCancel != nil {
+			s.afterWriteCancel()
+		}
+		close(cancelled)
+	})
+	err := s.conn.WriteJSON(message)
+	if !stopCancel() {
+		<-cancelled
+	}
+	if err != nil {
+		_ = s.Close()
+	}
+	return err
+}
+
+func (s *NotifySubscription) StartUtterance(utteranceID string) error {
+	return s.send(notifyWire{Type: notifyMsgUtteranceStart, UtteranceID: utteranceID})
+}
+
+func (s *NotifySubscription) SendUtteranceText(utteranceID, text string) error {
+	return s.send(notifyWire{Type: notifyMsgUtteranceText, UtteranceID: utteranceID, Text: text})
+}
+
+func (s *NotifySubscription) EndUtterance(utteranceID string) error {
+	return s.send(notifyWire{Type: notifyMsgUtteranceEnd, UtteranceID: utteranceID})
+}
+
+func (s *NotifySubscription) CancelUtterance(utteranceID string) error {
+	return s.send(notifyWire{Type: notifyMsgUtteranceCancel, UtteranceID: utteranceID})
+}
+
+func (s *NotifySubscription) CancelSpeech(scope string) error {
+	return s.send(notifyWire{Type: notifyMsgUtteranceCancel, Scope: scope})
+}
+
+func (s *NotifySubscription) Close() error {
+	var err error
+	s.closeOnce.Do(func() { err = s.conn.Close() })
+	return err
 }
 
 // Subscribe opens a change-notification WebSocket to a regional frame gateway
@@ -91,15 +190,14 @@ type NotifyHandlers struct {
 // run it in its own goroutine.
 //
 // gatewayURL is the winning regional signaling URL (argus-js
-// selectedGatewayURL, as an http(s) or ws(s) URL). readToken is the per-stream read
-// token relayed back from the browser (argus-js frameReadToken) — the same
-// credential FetchFrame uses.
+// selectedGatewayURL, as an http(s) or ws(s) URL). controlToken is the server-only
+// token returned by JoinStream and retained by the customer server.
 //
 // Because the connection is the subscription, the customer server holds exactly
 // one notify socket per stream, and it lands on whichever node the browser
-// reported the read token to — no cross-node fan-out is required.
-func (c *Client) Subscribe(ctx context.Context, gatewayURL, streamID, readToken string, opts *NotifyOptions, handlers NotifyHandlers) error {
-	wsURL, err := notifyWSURL(gatewayURL, readToken, opts, handlers.OnFrame != nil)
+// selected as the stream's region — no cross-node fan-out is required.
+func (c *Client) Subscribe(ctx context.Context, gatewayURL, streamID, controlToken string, opts *NotifyOptions, handlers NotifyHandlers) error {
+	wsURL, err := notifyWSURL(gatewayURL, opts, handlers.OnFrame != nil)
 	if err != nil {
 		return err
 	}
@@ -111,7 +209,8 @@ func (c *Client) Subscribe(ctx context.Context, gatewayURL, streamID, readToken 
 	connected := false
 	backoff := notifyReconnectMinBackoff
 	for {
-		conn, resp, dialErr := dialer.DialContext(ctx, wsURL, nil)
+		header := http.Header{"Authorization": []string{"Bearer " + controlToken}}
+		conn, resp, dialErr := dialer.DialContext(ctx, wsURL, header)
 		if dialErr != nil {
 			err := notifyHandshakeError(resp, dialErr)
 			// Initial setup failures retain the prompt-error behavior callers rely on.
@@ -144,6 +243,36 @@ func (c *Client) Subscribe(ctx context.Context, gatewayURL, streamID, readToken 
 		}
 		backoff = min(backoff*2, notifyReconnectMaxBackoff)
 	}
+}
+
+// OpenNotify opens a live bidirectional notify subscription. It is the API used
+// by customer servers that stream assistant utterances while independently
+// observing their lifecycle. Transport reconnection is deliberately left to the
+// caller because losing the socket cancels all in-flight utterances.
+func (c *Client) OpenNotify(ctx context.Context, gatewayURL, streamID, controlToken string, opts *NotifyOptions, handlers NotifyHandlers) (*NotifySubscription, error) {
+	wsURL, err := notifyWSURL(gatewayURL, opts, handlers.OnFrame != nil)
+	if err != nil {
+		return nil, err
+	}
+	dialer := c.wsDialer
+	if dialer == nil {
+		dialer = websocket.DefaultDialer
+	}
+	header := http.Header{"Authorization": []string{"Bearer " + controlToken}}
+	conn, response, err := dialer.DialContext(ctx, wsURL, header)
+	if err != nil {
+		return nil, notifyHandshakeError(response, err)
+	}
+	subscription := &NotifySubscription{conn: conn, ctx: ctx, done: make(chan struct{})}
+	go func() {
+		_, readErr := readNotifyConnection(ctx, conn, streamID, handlers)
+		subscription.errMu.Lock()
+		subscription.err = readErr
+		subscription.errMu.Unlock()
+		_ = subscription.Close()
+		close(subscription.done)
+	}()
+	return subscription, nil
 }
 
 const (
@@ -213,6 +342,19 @@ func readNotifyConnection(ctx context.Context, conn *websocket.Conn, streamID st
 			if handlers.OnTranscriptionUnavailable != nil {
 				handlers.OnTranscriptionUnavailable()
 			}
+		case notifyMsgUtteranceQueued, notifyMsgUtteranceStarted, notifyMsgUtterancePaused,
+			notifyMsgUtteranceResumed, notifyMsgUtteranceFinished, notifyMsgUtteranceCancelled,
+			notifyMsgUtteranceFailed, notifyMsgUtteranceRejected:
+			if handlers.OnUtterance != nil {
+				handlers.OnUtterance(UtteranceEvent{
+					Type: msg.Type, UtteranceID: msg.UtteranceID, Reason: msg.Reason,
+					DeliveryMode: msg.DeliveryMode, TextComplete: msg.TextComplete != nil && *msg.TextComplete,
+				})
+			}
+		case notifyMsgUserText:
+			if handlers.OnUserText != nil {
+				handlers.OnUserText(msg.MessageID, msg.Text)
+			}
 		case notifyMsgTokenExpiring:
 			if handlers.OnTokenExpiring != nil {
 				handlers.OnTokenExpiring()
@@ -260,15 +402,20 @@ func notifyHandshakeError(resp *http.Response, dialErr error) error {
 // notifyWire mirrors the gateway's notify.Message JSON. Kept local so the client
 // module stays free of an internal-package dependency.
 type notifyWire struct {
-	Type        string  `json:"type"`
-	Stream      string  `json:"stream,omitempty"`
-	Track       string  `json:"track,omitempty"`
-	SSIMScore   float64 `json:"ssim_score,omitempty"`
-	FrameFormat string  `json:"frame_format,omitempty"`
-	FrameBase64 string  `json:"frame_base64,omitempty"`
-	Timestamp   string  `json:"timestamp,omitempty"`
-	Text        string  `json:"text,omitempty"`
-	Reason      string  `json:"reason,omitempty"`
+	Type         string  `json:"type"`
+	Stream       string  `json:"stream,omitempty"`
+	Track        string  `json:"track,omitempty"`
+	SSIMScore    float64 `json:"ssim_score,omitempty"`
+	FrameFormat  string  `json:"frame_format,omitempty"`
+	FrameBase64  string  `json:"frame_base64,omitempty"`
+	Timestamp    string  `json:"timestamp,omitempty"`
+	Text         string  `json:"text,omitempty"`
+	Reason       string  `json:"reason,omitempty"`
+	UtteranceID  string  `json:"utterance_id,omitempty"`
+	MessageID    string  `json:"message_id,omitempty"`
+	Scope        string  `json:"scope,omitempty"`
+	DeliveryMode string  `json:"delivery_mode,omitempty"`
+	TextComplete *bool   `json:"text_complete,omitempty"`
 }
 
 const (
@@ -282,11 +429,25 @@ const (
 	notifyMsgNoSpeech                 = "no_speech"
 	notifyMsgTranscriptionInterrupted = "transcription_interrupted"
 	notifyMsgTranscriptionUnavailable = "transcription_unavailable"
+	notifyMsgUtteranceStart           = "utterance_start"
+	notifyMsgUtteranceText            = "utterance_text"
+	notifyMsgUtteranceEnd             = "utterance_end"
+	notifyMsgUtteranceCancel          = "utterance_cancel"
+	notifyMsgUtteranceQueued          = "utterance_queued"
+	notifyMsgUtteranceStarted         = "utterance_started"
+	notifyMsgUtterancePaused          = "utterance_paused"
+	notifyMsgUtteranceResumed         = "utterance_resumed"
+	notifyMsgUtteranceFinished        = "utterance_finished"
+	notifyMsgUtteranceCancelled       = "utterance_cancelled"
+	notifyMsgUtteranceFailed          = "utterance_failed"
+	notifyMsgUtteranceRejected        = "utterance_rejected"
+	notifyMsgUserText                 = "user_text"
 )
 
 // notifyWSURL builds the gateway /notify WebSocket URL, normalizing http(s) to
-// ws(s) and attaching the token and watch parameters as query values.
-func notifyWSURL(gatewayURL, readToken string, opts *NotifyOptions, watchFrames bool) (string, error) {
+// ws(s) and attaching watch parameters as query values. Authentication is sent
+// separately in the WebSocket handshake's Authorization header.
+func notifyWSURL(gatewayURL string, opts *NotifyOptions, watchFrames bool) (string, error) {
 	u, err := gatewayBaseURL(gatewayURL, gatewayWebSocket)
 	if err != nil {
 		return "", err
@@ -294,7 +455,6 @@ func notifyWSURL(gatewayURL, readToken string, opts *NotifyOptions, watchFrames 
 	u.Path = "/notify"
 
 	q := url.Values{}
-	q.Set("token", readToken)
 	if !watchFrames {
 		q.Set("watch_frames", "false")
 	}

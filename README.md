@@ -1,12 +1,14 @@
 # Argus Go Client
 
 A small Go client for the Argus video streaming platform. It runs on a
-customer's own backend and wraps the three things a server-side integration
+customer's own backend and wraps the four things a server-side integration
 needs:
 
 - **Mint join tokens** for new streams, to hand to an end user's browser.
 - **Fetch decoded frames** from a regional frame gateway.
 - **Subscribe to change notifications** over a regional gateway WebSocket.
+- **Stream text-to-speech utterances** and receive typed browser input over the
+  same bidirectional subscription.
 
 The package uses the Go standard library plus `gorilla/websocket` for notification
 subscriptions, without pulling in the rest of Argus.
@@ -46,20 +48,20 @@ named `argus`, so call sites read `argus.New(...)`, `argus.FetchFrame(...)`, and
 
 ## Authentication
 
-Three distinct credentials are in play; don't confuse them:
+Four distinct credentials are in play; don't confuse them:
 
 | Credential | Lifetime | Holder | Used for |
 | --- | --- | --- | --- |
 | **API key** | Long-lived, secret | Customer server (this library) | Minting join tokens; sent as `Authorization: ApiKey <key>` |
 | **Join token** | Short-lived JWT | Browser | Publishing one stream through signaling |
-| **Read token** | ~1-hour JWT | Browser, then customer server | Fetching frames and subscribing to change notifications for one stream in the selected region |
+| **Read token** | ~1-hour JWT | Browser, then customer server | Fetching frames for one stream in the selected region |
+| **Control token** | ~1-hour JWT | Customer server only | Bidirectional notify subscription, including text-to-speech commands |
 
 `JoinResponse.Token` is the publishing join token, not the read token. The
 gateway returns the read token to the browser during signaling. Relay that value
 and `publisher.selectedGatewayURL` back to the customer server for frame reads
-and notification subscriptions. The pair must stay together because the read
-token is region-scoped. Keep your API key on the server; never ship it to a
-browser.
+and frame reads. Retain `JoinResponse.ControlToken` on the customer server for
+notify; never ship the API key or control token to a browser.
 
 ## Usage
 
@@ -87,7 +89,7 @@ if err != nil {
     return err
 }
 // Forward join.Token and join.GatewayURLs to the end user's browser.
-// Keep join.StreamID for later reads.
+// Keep join.StreamID and join.ControlToken on the customer server.
 ```
 
 To pin a region, use `JoinStreamWithOptions`:
@@ -155,7 +157,7 @@ ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 
 go func() {
-    err := c.Subscribe(ctx, selectedGatewayURL, streamID, readToken,
+    err := c.Subscribe(ctx, selectedGatewayURL, streamID, join.ControlToken,
         &argus.NotifyOptions{
             Track:          "camera",
             Threshold:      0.85,
@@ -167,7 +169,8 @@ go func() {
             },
             OnTokenExpiring: func() {
                 // Prepare for this subscription to end at token expiry. In-place
-                // read-token renewal is planned separately.
+                // RefreshControlToken can mint a region-narrowed replacement;
+                // reconnect the subscription with it.
             },
             OnEnded: func(reason string) {
                 // reason is "stream_ended" or "superseded".
@@ -183,6 +186,13 @@ go func() {
 `NotifyEvent.Frame` contains decoded image bytes. A newer subscription for the
 same stream supersedes the older one, which receives `OnEnded("superseded")`.
 
+For speech, use `OpenNotify`, then call `StartUtterance`,
+`SendUtteranceText`, and `EndUtterance` on the returned live subscription.
+`NotifyHandlers.OnUtterance` receives terminal outcomes and `OnUserText`
+receives typed browser messages. Utterance IDs are unique within a subscription,
+limited to 128 UTF-8 bytes, and capped at 4,096 accepted IDs per subscription.
+Text chunks are limited to 4 KiB and an utterance to 64 KiB.
+
 ## Errors
 
 `JoinStream*`, `FetchFrame`, and `Subscribe` return wrapped errors. Frame and
@@ -196,7 +206,7 @@ Cancellation of a live subscription returns the context error.
 | `client.go` | `Client`, `New`, `NewWithHTTPClient`, package docs |
 | `stream.go` | `JoinStream` / `JoinStreamWithOptions` and their types |
 | `frame.go` | `FetchFrame` and `FrameOptions` |
-| `notify.go` | `Subscribe`, `NotifyEvent`, `NotifyOptions`, `NotifyHandlers` |
+| `notify.go` | `Subscribe`, `OpenNotify`, utterance commands, events and handlers |
 
 ## Testing
 

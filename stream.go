@@ -11,7 +11,7 @@ import (
 
 // JoinResponse is the result of creating a stream via JoinStream. The Token and
 // GatewayURLs are meant to be forwarded to the end user's browser so it can
-// publish video; the customer server retains StreamID for later reads.
+// publish video; the customer server retains StreamID and ControlToken.
 type JoinResponse struct {
 	// Token is the short-lived join JWT. Forward it to the browser to publish.
 	// It is NOT the read token — the frame gateway rejects it. The read token
@@ -27,6 +27,15 @@ type JoinResponse struct {
 	// read token. FetchFrame and Subscribe accept that signaling URL directly and
 	// normalize it to the appropriate gateway endpoint.
 	GatewayURLs []string `json:"gateway_urls"`
+	// ControlToken is retained by the customer server and authenticates its
+	// bidirectional /notify socket. It must never be sent to the browser.
+	ControlToken          string `json:"control_token"`
+	ControlTokenExpiresAt string `json:"control_token_expires_at"`
+}
+
+type ControlTokenResponse struct {
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expires_at"`
 }
 
 // JoinOptions configures a JoinStream request. A nil *JoinOptions selects an
@@ -42,6 +51,30 @@ type JoinOptions struct {
 	// Keyterms boost recognition of domain vocabulary during transcription.
 	// Server-side only, like Language.
 	Keyterms []string
+}
+
+// RefreshControlToken replaces an expiring control token. Once placement has
+// completed the control plane narrows the new token to the fixed region.
+func (c *Client) RefreshControlToken(ctx context.Context, streamID string) (*ControlTokenResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/streams/"+streamID+"/control-token", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "ApiKey "+c.apiKey)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		message, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(message))
+	}
+	var result ControlTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &result, nil
 }
 
 // joinStreamBody mirrors the control plane's createStreamRequest JSON shape.

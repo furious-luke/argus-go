@@ -22,6 +22,7 @@ func TestSpec_Join_ReturnsTokenBundle(t *testing.T) {
 	assert.Equal(t, "join-jwt", join.Token)
 	assert.Equal(t, "stream-1", join.StreamID)
 	assert.Equal(t, []string{"https://gw.example.com"}, join.GatewayURLs)
+	assert.Equal(t, "control-jwt", join.ControlToken)
 }
 
 func TestSpec_Join_AuthenticatesWithAPIKey(t *testing.T) {
@@ -161,7 +162,7 @@ func TestSpec_Subscribe_DeliversFrameBytes(t *testing.T) {
 	assert.True(t, frames[0].Timestamp.Equal(now))
 }
 
-func TestSpec_Subscribe_AttachesTokenAndWatchParams(t *testing.T) {
+func TestSpec_Subscribe_AuthenticatesWithControlTokenAndAttachesWatchParams(t *testing.T) {
 	a := newArranger(t)
 	gateway := a.NotifyGateway()
 	gateway.EnqueueStreamEnded()
@@ -173,10 +174,35 @@ func TestSpec_Subscribe_AttachesTokenAndWatchParams(t *testing.T) {
 
 	target := gateway.LastConnectTarget()
 	assert.Contains(t, target, "/notify")
-	assert.Contains(t, target, "token=read-jwt")
+	assert.NotContains(t, target, "token=")
+	assert.Equal(t, "Bearer control-jwt", gateway.LastAuthorization())
 	assert.Contains(t, target, "track=screen")
 	assert.Contains(t, target, "threshold=0.9")
 	assert.Contains(t, target, "poll_interval_ms=1500")
+}
+
+func TestSpec_NotifySubscription_StreamsIdentifiedUtteranceCommands(t *testing.T) {
+	gateway := newArranger(t).NotifyGateway()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	messages := gateway.StreamUtterance(ctx, "u1", "hello ", "world")
+	require.Len(t, messages, 4)
+	assert.Equal(t, notifyMsgUtteranceStart, messages[0].Type)
+	assert.Equal(t, "u1", messages[0].UtteranceID)
+	assert.Equal(t, []string{"hello ", "world"}, []string{messages[1].Text, messages[2].Text})
+	assert.Equal(t, notifyMsgUtteranceEnd, messages[3].Type)
+}
+
+func TestSpec_NotifySubscription_StalledCommandWriteReturnsWithinTransportBound(t *testing.T) {
+	gateway := newArranger(t).NotifyGateway()
+	assert.True(t, gateway.StalledCommandReturnsWithinBound())
+}
+
+// Context cancellation interrupts a blocked command through the socket-close
+// path; it never becomes a second writer by changing the write deadline.
+func TestSpec_NotifySubscription_CancellationPreservesSingleTransportWriter(t *testing.T) {
+	gateway := newArranger(t).NotifyGateway()
+	assert.True(t, gateway.CancellationKeepsSingleWriter())
 }
 
 // A transcript-only customer owns the notify subscription but explicitly tells

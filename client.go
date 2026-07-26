@@ -6,13 +6,15 @@
 // "see". This package is the server-side half of that story — it is intended to
 // run on a customer's own backend, authenticated with the customer's API key.
 //
-// It covers three things a customer server needs to do:
+// It covers four things a customer server needs to do:
 //
 //   - Mint join tokens for new streams, which are handed to a browser so it can
 //     publish video (JoinStream / JoinStreamWithOptions).
 //   - Fetch decoded frames from a regional frame gateway (FetchFrame).
 //   - Subscribe to change notifications for a stream over a persistent WebSocket,
 //     receiving the changed frames as they happen (Subscribe).
+//   - Stream assistant utterances and observe typed user input over a live,
+//     bidirectional notify subscription (OpenNotify).
 //
 // Subscribe holds one WebSocket per stream to the stream's regional gateway. The
 // connection is the subscription: it lands on whichever of the customer's nodes
@@ -21,7 +23,7 @@
 //
 // # Authentication
 //
-// Three distinct credentials are in play, and the join and read tokens must not
+// Four distinct credentials are in play, and the browser and server tokens must not
 // be confused:
 //
 //   - The API key identifies the customer to the control plane. It is
@@ -34,6 +36,9 @@
 //     during signaling. It is surfaced to the browser as frameReadToken and
 //     relayed back to your server, which presents it to FetchFrame as a bearer
 //     token. It is scoped to a single stream and pinned to the serving region.
+//   - The control token is returned in JoinResponse.ControlToken and retained
+//     only by the customer server. It authenticates Subscribe/OpenNotify and can
+//     enqueue paid synthesis; never send it to the browser.
 //
 // # Typical flow
 //

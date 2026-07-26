@@ -21,7 +21,7 @@ func TestNotifyWSURL_NormalizesScheme(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			raw, err := notifyWSURL(tc.gatewayURL, "read-jwt", nil, true)
+			raw, err := notifyWSURL(tc.gatewayURL, nil, true)
 			require.NoError(t, err)
 			u, err := url.Parse(raw)
 			require.NoError(t, err)
@@ -32,12 +32,12 @@ func TestNotifyWSURL_NormalizesScheme(t *testing.T) {
 }
 
 func TestNotifyWSURL_RejectsUnsupportedScheme(t *testing.T) {
-	_, err := notifyWSURL("ftp://gw.example.com", "read-jwt", nil, true)
+	_, err := notifyWSURL("ftp://gw.example.com", nil, true)
 	require.Error(t, err)
 }
 
-func TestNotifyWSURL_AttachesTokenAndWatchParams(t *testing.T) {
-	raw, err := notifyWSURL("https://gw.example.com", "read-jwt", &NotifyOptions{
+func TestNotifyWSURL_AttachesWatchParamsWithoutCredentialQuery(t *testing.T) {
+	raw, err := notifyWSURL("https://gw.example.com", &NotifyOptions{
 		Track:          "screen",
 		Threshold:      0.9,
 		PollIntervalMs: 1500,
@@ -47,20 +47,20 @@ func TestNotifyWSURL_AttachesTokenAndWatchParams(t *testing.T) {
 	u, err := url.Parse(raw)
 	require.NoError(t, err)
 	q := u.Query()
-	assert.Equal(t, "read-jwt", q.Get("token"))
+	assert.False(t, q.Has("token"))
 	assert.Equal(t, "screen", q.Get("track"))
 	assert.Equal(t, "0.9", q.Get("threshold"))
 	assert.Equal(t, "1500", q.Get("poll_interval_ms"))
 }
 
 func TestNotifyWSURL_OmitsUnsetWatchParams(t *testing.T) {
-	raw, err := notifyWSURL("https://gw.example.com", "read-jwt", nil, true)
+	raw, err := notifyWSURL("https://gw.example.com", nil, true)
 	require.NoError(t, err)
 
 	u, err := url.Parse(raw)
 	require.NoError(t, err)
 	q := u.Query()
-	assert.Equal(t, "read-jwt", q.Get("token"))
+	assert.False(t, q.Has("token"))
 	assert.False(t, q.Has("track"))
 	assert.False(t, q.Has("threshold"))
 	assert.False(t, q.Has("poll_interval_ms"))
