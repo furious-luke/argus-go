@@ -1,12 +1,12 @@
 # Argus Go Client
 
-A small Go client for the Argus video streaming platform. It runs on a
-customer's own backend and wraps the four things a server-side integration
-needs:
+A small Go client for the Argus real-time media platform. It runs on a
+customer's own backend and wraps what a server-side integration needs:
 
 - **Mint join tokens** for new streams, to hand to an end user's browser.
 - **Fetch decoded frames** from a regional frame gateway.
 - **Subscribe to change notifications** over a regional gateway WebSocket.
+- **Receive live transcripts** of the user's speech when a microphone is published.
 - **Stream text-to-speech utterances** and receive typed browser input over the
   same bidirectional subscription.
 
@@ -59,9 +59,10 @@ Four distinct credentials are in play; don't confuse them:
 
 `JoinResponse.Token` is the publishing join token, not the read token. The
 gateway returns the read token to the browser during signaling. Relay that value
-and `publisher.selectedGatewayURL` back to the customer server for frame reads
-and frame reads. Retain `JoinResponse.ControlToken` on the customer server for
-notify; never ship the API key or control token to a browser.
+and `publisher.selectedGatewayURL` back to the customer server for frame reads.
+Retain `JoinResponse.ControlToken` on the customer server for notify (change
+notifications and text-to-speech); never ship the API key or control token to a
+browser.
 
 ## Usage
 
@@ -92,14 +93,18 @@ if err != nil {
 // Keep join.StreamID and join.ControlToken on the customer server.
 ```
 
-To pin a region, use `JoinStreamWithOptions`:
+To pin a region or set transcription options, use `JoinStreamWithOptions`:
 
 ```go
 join, err := c.JoinStreamWithOptions(ctx, &argus.JoinOptions{
-    Region: "eu-west-1", // optional; omit to let Argus choose
+    Region:   "eu-west-1",               // optional; omit to let Argus choose
+    Language: "en-US",                   // optional BCP-47 transcription hint
+    Keyterms: []string{"Argus", "SSIM"}, // optional; boost domain vocabulary
 })
 ```
 
+`Language` and `Keyterms` are server-side transcription options (never exposed to
+the browser) that take effect only if the stream publishes a microphone track.
 Change-detection parameters are supplied to `Subscribe`, so they are
 per-subscription and can change without recreating the stream.
 
@@ -167,10 +172,12 @@ go func() {
             OnFrame: func(ev argus.NotifyEvent) {
                 // ev.StreamID, ev.Track, ev.SSIMScore, ev.FrameFormat, ev.Frame ...
             },
+            OnTranscript: func(text string) {
+                // A complete (final) utterance from the microphone track.
+            },
             OnTokenExpiring: func() {
-                // Prepare for this subscription to end at token expiry. In-place
-                // RefreshControlToken can mint a region-narrowed replacement;
-                // reconnect the subscription with it.
+                // The control token is near expiry. RefreshControlToken mints a
+                // replacement; reconnect the subscription with it.
             },
             OnEnded: func(reason string) {
                 // reason is "stream_ended" or "superseded".
@@ -186,12 +193,36 @@ go func() {
 `NotifyEvent.Frame` contains decoded image bytes. A newer subscription for the
 same stream supersedes the older one, which receives `OnEnded("superseded")`.
 
-For speech, use `OpenNotify`, then call `StartUtterance`,
-`SendUtteranceText`, and `EndUtterance` on the returned live subscription.
-`NotifyHandlers.OnUtterance` receives terminal outcomes and `OnUserText`
-receives typed browser messages. Utterance IDs are unique within a subscription,
-limited to 128 UTF-8 bytes, and capped at 4,096 accepted IDs per subscription.
-Text chunks are limited to 4 KiB and an utterance to 64 KiB.
+### Transcription (microphone streams)
+
+When the browser publishes a microphone track, Argus transcribes it server-side
+and delivers the results over this same subscription. Leave `OnFrame` nil for a
+transcript-only consumer (a voice agent that needs no video) — that also tells the
+server to skip its video watcher. The transcription handlers are all optional:
+
+| Handler | Fires when |
+| --- | --- |
+| `OnSpeechStarted` | The speaker began talking (stop speaking, yield the turn). |
+| `OnTranscript(text)` | A **complete** utterance is ready (final only — no interim text). |
+| `OnNoSpeech` | An utterance produced no usable text (silence/noise). |
+| `OnTranscriptionInterrupted` | **Recoverable** break; ask the speaker to repeat once input resumes. |
+| `OnTranscriptionUnavailable` | **Terminal** break; transcription will not resume for this stream. |
+
+### Text-to-speech (`OpenNotify`)
+
+For a voice agent that also *speaks*, use `OpenNotify` (not `Subscribe`) — it
+returns a live `*NotifySubscription` you write utterances to, and does **not**
+auto-reconnect (losing the socket cancels in-flight utterances). Call
+`StartUtterance`, `SendUtteranceText`, and `EndUtterance`; cancel with
+`CancelUtterance(id)` or `CancelSpeech("all"|"current")`. `OnUtterance` reports the
+lifecycle (`UtteranceEvent`) and `OnUserText` receives accepted typed browser
+input. Argus synthesizes the utterance onto an outbound `speech` WebRTC track the
+browser plays when speech is enabled, and always sends the text to the browser's
+`argus.text` data channel. Without an enabled speech track, delivery is immediate
+and text-only; with speech, the text is paced with the audio. Utterance IDs are
+unique within a subscription, limited to 128 UTF-8 bytes, and capped at 4,096
+accepted IDs per subscription. Text chunks are limited to 4 KiB and an utterance
+to 64 KiB.
 
 ## Errors
 
@@ -204,9 +235,10 @@ Cancellation of a live subscription returns the context error.
 | File | Contents |
 | --- | --- |
 | `client.go` | `Client`, `New`, `NewWithHTTPClient`, package docs |
-| `stream.go` | `JoinStream` / `JoinStreamWithOptions` and their types |
+| `stream.go` | `JoinStream` / `JoinStreamWithOptions`, `RefreshControlToken`, and their types |
 | `frame.go` | `FetchFrame` and `FrameOptions` |
-| `notify.go` | `Subscribe`, `OpenNotify`, utterance commands, events and handlers |
+| `notify.go` | `Subscribe`, `OpenNotify`, transcription/utterance events, utterance commands, handlers |
+| `track.go` | `TrackType` constants (`TrackCamera`, `TrackScreen`) |
 
 ## Testing
 

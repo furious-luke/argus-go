@@ -141,10 +141,24 @@ type NotifyGatewayActor struct {
 	gateway    *fakeNotifyGateway
 	gatewayURL string
 
-	mu        sync.Mutex
-	frames    []NotifyEvent
-	endReason string
-	expiring  int
+	mu                       sync.Mutex
+	frames                   []NotifyEvent
+	endReason                string
+	expiring                 int
+	transcripts              []string
+	speechStarted            int
+	noSpeech                 int
+	transcriptionInterrupted int
+	transcriptionUnavailable int
+	utteranceEvents          []UtteranceEvent
+	userTexts                []userTextRecord
+}
+
+// userTextRecord captures the message identity and body a user_text message
+// delivers, so a spec can assert both arguments OnUserText received.
+type userTextRecord struct {
+	MessageID string
+	Text      string
 }
 
 // deadlineWriteTrackingConn wraps the real TCP connection beneath Gorilla and
@@ -294,6 +308,50 @@ func (a *NotifyGatewayActor) EnqueueError(reason string) {
 	a.gateway.enqueue(notifyWire{Type: notifyMsgError, Reason: reason})
 }
 
+// EnqueueSpeechStarted queues a speech_started message.
+func (a *NotifyGatewayActor) EnqueueSpeechStarted() {
+	a.gateway.enqueue(notifyWire{Type: notifyMsgSpeechStarted})
+}
+
+// EnqueueTranscript queues a transcript message carrying a final utterance.
+func (a *NotifyGatewayActor) EnqueueTranscript(text string) {
+	a.gateway.enqueue(notifyWire{Type: notifyMsgTranscript, Text: text})
+}
+
+// EnqueueNoSpeech queues a no_speech message.
+func (a *NotifyGatewayActor) EnqueueNoSpeech() {
+	a.gateway.enqueue(notifyWire{Type: notifyMsgNoSpeech})
+}
+
+// EnqueueTranscriptionInterrupted queues a recoverable transcription break.
+func (a *NotifyGatewayActor) EnqueueTranscriptionInterrupted() {
+	a.gateway.enqueue(notifyWire{Type: notifyMsgTranscriptionInterrupted})
+}
+
+// EnqueueTranscriptionUnavailable queues a terminal transcription break.
+func (a *NotifyGatewayActor) EnqueueTranscriptionUnavailable() {
+	a.gateway.enqueue(notifyWire{Type: notifyMsgTranscriptionUnavailable})
+}
+
+// EnqueueUserText queues a user_text message carrying a message identity and body.
+func (a *NotifyGatewayActor) EnqueueUserText(messageID, text string) {
+	a.gateway.enqueue(notifyWire{Type: notifyMsgUserText, MessageID: messageID, Text: text})
+}
+
+// EnqueueUtteranceEvent queues an utterance-lifecycle message of the given type,
+// carrying the utterance identity, delivery mode, and reason a spec wants to
+// observe. textComplete is attached verbatim, so passing nil leaves the wire
+// field absent (as the gateway does when it never sends the flag).
+func (a *NotifyGatewayActor) EnqueueUtteranceEvent(msgType, utteranceID, deliveryMode, reason string, textComplete *bool) {
+	a.gateway.enqueue(notifyWire{
+		Type:         msgType,
+		UtteranceID:  utteranceID,
+		DeliveryMode: deliveryMode,
+		Reason:       reason,
+		TextComplete: textComplete,
+	})
+}
+
 // handlers records everything the subscription observes so specs can assert on
 // it after Subscribe returns.
 func (a *NotifyGatewayActor) handlers() NotifyHandlers {
@@ -302,6 +360,41 @@ func (a *NotifyGatewayActor) handlers() NotifyHandlers {
 			a.mu.Lock()
 			defer a.mu.Unlock()
 			a.frames = append(a.frames, ev)
+		},
+		OnSpeechStarted: func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.speechStarted++
+		},
+		OnTranscript: func(text string) {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.transcripts = append(a.transcripts, text)
+		},
+		OnNoSpeech: func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.noSpeech++
+		},
+		OnTranscriptionInterrupted: func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.transcriptionInterrupted++
+		},
+		OnTranscriptionUnavailable: func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.transcriptionUnavailable++
+		},
+		OnUtterance: func(ev UtteranceEvent) {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.utteranceEvents = append(a.utteranceEvents, ev)
+		},
+		OnUserText: func(messageID, text string) {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.userTexts = append(a.userTexts, userTextRecord{MessageID: messageID, Text: text})
 		},
 		OnTokenExpiring: func() {
 			a.mu.Lock()
@@ -349,6 +442,55 @@ func (a *NotifyGatewayActor) TokenExpiringCount() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.expiring
+}
+
+// Transcripts returns the final utterance texts OnTranscript delivered, in order.
+func (a *NotifyGatewayActor) Transcripts() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.transcripts...)
+}
+
+// SpeechStartedCount returns how many times OnSpeechStarted fired.
+func (a *NotifyGatewayActor) SpeechStartedCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.speechStarted
+}
+
+// NoSpeechCount returns how many times OnNoSpeech fired.
+func (a *NotifyGatewayActor) NoSpeechCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.noSpeech
+}
+
+// TranscriptionInterruptedCount returns how many times OnTranscriptionInterrupted fired.
+func (a *NotifyGatewayActor) TranscriptionInterruptedCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.transcriptionInterrupted
+}
+
+// TranscriptionUnavailableCount returns how many times OnTranscriptionUnavailable fired.
+func (a *NotifyGatewayActor) TranscriptionUnavailableCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.transcriptionUnavailable
+}
+
+// UtteranceEvents returns the utterance-lifecycle events OnUtterance surfaced, in order.
+func (a *NotifyGatewayActor) UtteranceEvents() []UtteranceEvent {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]UtteranceEvent(nil), a.utteranceEvents...)
+}
+
+// UserTexts returns the (message id, text) pairs OnUserText delivered, in order.
+func (a *NotifyGatewayActor) UserTexts() []userTextRecord {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]userTextRecord(nil), a.userTexts...)
 }
 
 // LastConnectTarget returns the path+query the gateway saw on the WebSocket

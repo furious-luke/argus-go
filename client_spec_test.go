@@ -357,6 +357,148 @@ func TestSpec_Subscribe_DoesNotLeakGoroutineWhenStreamEnds(t *testing.T) {
 	}
 }
 
+func TestSpec_Subscribe_ReportsSpeechStarted(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueSpeechStarted()
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, gateway.Subscribe(ctx, nil))
+	assert.Equal(t, 1, gateway.SpeechStartedCount())
+}
+
+func TestSpec_Subscribe_DeliversFinalTranscriptText(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueTranscript("turn left at the second light")
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, gateway.Subscribe(ctx, nil))
+	assert.Equal(t, []string{"turn left at the second light"}, gateway.Transcripts())
+}
+
+func TestSpec_Subscribe_ReportsNoSpeech(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueNoSpeech()
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, gateway.Subscribe(ctx, nil))
+	assert.Equal(t, 1, gateway.NoSpeechCount())
+}
+
+func TestSpec_Subscribe_ReportsRecoverableTranscriptionInterruption(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueTranscriptionInterrupted()
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, gateway.Subscribe(ctx, nil))
+	assert.Equal(t, 1, gateway.TranscriptionInterruptedCount())
+}
+
+func TestSpec_Subscribe_ReportsTerminalTranscriptionUnavailability(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueTranscriptionUnavailable()
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, gateway.Subscribe(ctx, nil))
+	assert.Equal(t, 1, gateway.TranscriptionUnavailableCount())
+}
+
+func TestSpec_Subscribe_DeliversUserTextWithMessageIdentity(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueUserText("msg-7", "can you repeat that")
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, gateway.Subscribe(ctx, nil))
+
+	texts := gateway.UserTexts()
+	require.Len(t, texts, 1)
+	assert.Equal(t, "msg-7", texts[0].MessageID)
+	assert.Equal(t, "can you repeat that", texts[0].Text)
+}
+
+func TestSpec_Subscribe_SurfacesUtteranceLifecycleFields(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	complete := true
+	gateway.EnqueueUtteranceEvent(notifyMsgUtteranceFinished, "u1", "streaming", "", &complete)
+	gateway.EnqueueUtteranceEvent(notifyMsgUtteranceRejected, "u2", "", "stream not accepting speech", nil)
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, gateway.Subscribe(ctx, nil))
+
+	events := gateway.UtteranceEvents()
+	require.Len(t, events, 2)
+	assert.Equal(t, UtteranceEvent{Type: notifyMsgUtteranceFinished, UtteranceID: "u1", DeliveryMode: "streaming", TextComplete: true}, events[0])
+	assert.Equal(t, UtteranceEvent{Type: notifyMsgUtteranceRejected, UtteranceID: "u2", Reason: "stream not accepting speech"}, events[1])
+}
+
+func TestSpec_Subscribe_SurfacesEveryUtteranceLifecycleType(t *testing.T) {
+	cases := []struct {
+		name    string
+		msgType string
+	}{
+		{"queued", notifyMsgUtteranceQueued},
+		{"started", notifyMsgUtteranceStarted},
+		{"paused", notifyMsgUtterancePaused},
+		{"resumed", notifyMsgUtteranceResumed},
+		{"finished", notifyMsgUtteranceFinished},
+		{"cancelled", notifyMsgUtteranceCancelled},
+		{"failed", notifyMsgUtteranceFailed},
+		{"rejected", notifyMsgUtteranceRejected},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newArranger(t)
+			gateway := a.NotifyGateway()
+			gateway.EnqueueUtteranceEvent(tc.msgType, "u1", "", "", nil)
+			gateway.EnqueueStreamEnded()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			require.NoError(t, gateway.Subscribe(ctx, nil))
+
+			events := gateway.UtteranceEvents()
+			require.Len(t, events, 1)
+			assert.Equal(t, tc.msgType, events[0].Type)
+			assert.Equal(t, "u1", events[0].UtteranceID)
+		})
+	}
+}
+
+func TestSpec_Subscribe_OmitsTextCompleteWhenAbsentFromWire(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueUtteranceEvent(notifyMsgUtteranceFinished, "u1", "buffered", "", nil)
+	gateway.EnqueueStreamEnded()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, gateway.Subscribe(ctx, nil))
+
+	events := gateway.UtteranceEvents()
+	require.Len(t, events, 1)
+	assert.False(t, events[0].TextComplete)
+}
+
 func notifyFrameBytes(events []NotifyEvent) [][]byte {
 	frames := make([][]byte, len(events))
 	for i, event := range events {
