@@ -306,6 +306,21 @@ func TestSpec_Subscribe_UsesCustomTLSConfiguration(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// A customer HTTP client configured for HTTP/2 advertises "h2" via ALPN. The
+// WebSocket handshake runs over HTTP/1.1, so the client must not let that ALPN
+// list reach the notify dial — otherwise the gateway negotiates HTTP/2 and the
+// handshake dies on an unparseable HTTP/2 frame ("protocol \"h2\" was given but
+// is not supported"). Subscribe succeeding proves it negotiated HTTP/1.1.
+func TestSpec_Subscribe_SucceedsWhenHTTPClientAdvertisesHTTP2(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.HTTP2AdvertisingNotifyGateway()
+	gateway.EnqueueStreamEnded()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := gateway.Subscribe(ctx, nil)
+	require.NoError(t, err)
+}
+
 func TestSpec_Subscribe_ReturnsWhenContextCancelled(t *testing.T) {
 	a := newArranger(t)
 	gateway := a.NotifyGateway()

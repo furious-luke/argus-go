@@ -124,7 +124,16 @@ func websocketDialerForHTTPClient(httpClient *http.Client) *websocket.Dialer {
 		dialer.NetDialContext = t.DialContext
 		dialer.NetDialTLSContext = t.DialTLSContext
 		if t.TLSClientConfig != nil {
-			dialer.TLSClientConfig = t.TLSClientConfig.Clone()
+			tlsConfig := t.TLSClientConfig.Clone()
+			// The HTTP transport advertises "h2" via ALPN (Go appends it to
+			// NextProtos when it enables HTTP/2, e.g. via ForceAttemptHTTP2).
+			// A WebSocket handshake runs over HTTP/1.1, so carrying that ALPN
+			// list into the dial lets the server negotiate h2 and reply with
+			// HTTP/2 frames that gorilla/websocket cannot parse ("protocol
+			// \"h2\" was given but is not supported"). Clear it so the
+			// handshake negotiates HTTP/1.1.
+			tlsConfig.NextProtos = nil
+			dialer.TLSClientConfig = tlsConfig
 		}
 		if t.TLSHandshakeTimeout > 0 {
 			dialer.HandshakeTimeout = t.TLSHandshakeTimeout
