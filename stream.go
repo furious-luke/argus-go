@@ -51,6 +51,18 @@ type JoinOptions struct {
 	// Keyterms boost recognition of domain vocabulary during transcription.
 	// Server-side only, like Language.
 	Keyterms []string
+	// RecordingEnabled opts this stream into recording to object storage for later
+	// review (separate video/mic/speech tracks tied to one timeline by a manifest).
+	// It is not part of the live read path.
+	RecordingEnabled bool
+	// RecordingRetentionDays is how long recordings are retained before deletion.
+	// Zero defers to the server default. Ignored unless RecordingEnabled is set.
+	RecordingRetentionDays int
+	// StorageRegion pins where recordings are stored at rest, decoupled from the
+	// processing region, for data-residency or cost reasons. Empty stores in the
+	// processing region. It requires RecordingEnabled and must be a
+	// residency-compatible region with usable storage, else the create is rejected.
+	StorageRegion string
 }
 
 // RefreshControlToken replaces an expiring control token. Once placement has
@@ -79,9 +91,12 @@ func (c *Client) RefreshControlToken(ctx context.Context, streamID string) (*Con
 
 // joinStreamBody mirrors the control plane's createStreamRequest JSON shape.
 type joinStreamBody struct {
-	Region   string   `json:"region,omitempty"`
-	Language string   `json:"language,omitempty"`
-	Keyterms []string `json:"keyterms,omitempty"`
+	Region                 string   `json:"region,omitempty"`
+	RecordingEnabled       bool     `json:"recording_enabled,omitempty"`
+	RecordingRetentionDays int      `json:"recording_retention_days,omitempty"`
+	StorageRegion          string   `json:"storage_region,omitempty"`
+	Language               string   `json:"language,omitempty"`
+	Keyterms               []string `json:"keyterms,omitempty"`
 }
 
 // JoinStream creates a new stream with default options and returns its join
@@ -96,6 +111,9 @@ func (c *Client) JoinStreamWithOptions(ctx context.Context, opts *JoinOptions) (
 	var body joinStreamBody
 	if opts != nil {
 		body.Region = opts.Region
+		body.RecordingEnabled = opts.RecordingEnabled
+		body.RecordingRetentionDays = opts.RecordingRetentionDays
+		body.StorageRegion = opts.StorageRegion
 		body.Language = opts.Language
 		body.Keyterms = opts.Keyterms
 	}

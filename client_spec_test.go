@@ -39,6 +39,32 @@ func TestSpec_Join_ForwardsRegion(t *testing.T) {
 	assert.Equal(t, "eu-west-1", server.LastJoinRequest().Region)
 }
 
+func TestSpec_Join_ForwardsRecordingOptions(t *testing.T) {
+	a := newArranger(t)
+	server := a.CustomerServer()
+	server.MustJoin(&JoinOptions{
+		RecordingEnabled:       true,
+		RecordingRetentionDays: 30,
+		StorageRegion:          "eu-central-1",
+	})
+	req := server.LastJoinRequest()
+	assert.True(t, req.RecordingEnabled, "recording is enabled on the create request")
+	assert.Equal(t, 30, req.RecordingRetentionDays)
+	assert.Equal(t, "eu-central-1", req.StorageRegion, "storage-at-rest region is pinned independently of the processing region")
+}
+
+// Recording is off and no storage region is pinned unless explicitly requested,
+// so the fields are omitted from the create request by default.
+func TestSpec_Join_OmitsRecordingByDefault(t *testing.T) {
+	a := newArranger(t)
+	server := a.CustomerServer()
+	server.MustJoin(&JoinOptions{Region: "eu-west-1"})
+	req := server.LastJoinRequest()
+	assert.False(t, req.RecordingEnabled)
+	assert.Zero(t, req.RecordingRetentionDays)
+	assert.Empty(t, req.StorageRegion)
+}
+
 func TestSpec_Join_SurfacesServerError(t *testing.T) {
 	a := newArranger(t)
 	server := a.CustomerServer()
