@@ -32,6 +32,16 @@ func TestSpec_Join_AuthenticatesWithAPIKey(t *testing.T) {
 	assert.Equal(t, "ApiKey "+defaultAPIKey, server.LastJoinAuthHeader())
 }
 
+func TestSpec_PublisherToken_ReusesExistingStreamWithoutServerCredentials(t *testing.T) {
+	server := newArranger(t).CustomerServer()
+	response := server.MustRefreshPublisher("stream-1")
+
+	assert.Equal(t, "fresh-join-jwt", response.Token)
+	assert.Equal(t, "stream-1", response.StreamID)
+	assert.Equal(t, []string{"https://gw.example.com"}, response.GatewayURLs)
+	assert.Equal(t, "ApiKey "+defaultAPIKey, server.LastPublisherTokenAuthHeader())
+}
+
 func TestSpec_Join_ForwardsRegion(t *testing.T) {
 	a := newArranger(t)
 	server := a.CustomerServer()
@@ -93,6 +103,17 @@ func TestSpec_Join_SurfacesServerError(t *testing.T) {
 	_, err := server.Join(&JoinOptions{Region: "us-east-1"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "region violates residency policy")
+}
+
+func TestSpec_Join_PreservesStableServerErrorCode(t *testing.T) {
+	a := newArranger(t)
+	server := a.CustomerServer()
+	server.SetJoinResponse(http.StatusConflict, `{"error":"stale_catalog_version","message":"catalog changed"}`)
+
+	_, err := server.Join(&JoinOptions{Voice: &VoiceConfig{CatalogVersion: "old"}})
+	var joinErr *StreamJoinError
+	require.ErrorAs(t, err, &joinErr)
+	assert.Equal(t, StreamJoinCodeStaleCatalogVersion, joinErr.StreamJoinErrorCode())
 }
 
 func TestSpec_Frame_ReturnsImageBytes(t *testing.T) {
@@ -300,6 +321,39 @@ func TestSpec_Subscribe_SurfacesErrorMessage(t *testing.T) {
 	err := gateway.Subscribe(ctx, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "token expired")
+}
+
+func TestSpec_Subscribe_PreservesTerminalErrorReason(t *testing.T) {
+	a := newArranger(t)
+	gateway := a.NotifyGateway()
+	gateway.EnqueueError(NotifyReasonControlTokenExpired)
+
+	err := gateway.Subscribe(context.Background(), nil)
+	var notifyErr *NotifyTerminalError
+	require.ErrorAs(t, err, &notifyErr)
+	assert.Equal(t, NotifyReasonControlTokenExpired, notifyErr.NotifyTerminalReason())
+}
+
+// TestSpec_NotifyReasons_PinWireValues locks the terminal-reason strings this
+// SDK exposes to integrations. They must byte-match the values the Argus gateway
+// emits on the wire (argus/notify.Reason*), so a change on either side that
+// breaks classification fails a test on that side.
+func TestSpec_NotifyReasons_PinWireValues(t *testing.T) {
+	assert.Equal(t, "control token expired", NotifyReasonControlTokenExpired)
+	assert.Equal(t, "read token expired", NotifyReasonReadTokenExpired)
+	assert.Equal(t, "mesh connection lost", NotifyReasonMeshConnectionLost)
+	assert.Equal(t, "mesh connection unavailable", NotifyReasonMeshConnectionUnavailable)
+	assert.Equal(t, "gateway shutting down", NotifyReasonGatewayShuttingDown)
+	assert.Equal(t, "stream command queue saturated", NotifyReasonStreamCommandQueueSaturated)
+	assert.Equal(t, "stream not live", NotifyReasonStreamNotLive)
+	assert.Equal(t, "subscribe failed", NotifyReasonSubscribeFailed)
+}
+
+// TestSpec_StreamJoinCodes_PinWireValues locks the stream-creation error codes
+// this SDK exposes. They must byte-match the codes Argus emits (argus/voice.Code*).
+func TestSpec_StreamJoinCodes_PinWireValues(t *testing.T) {
+	assert.Equal(t, "stale_catalog_version", StreamJoinCodeStaleCatalogVersion)
+	assert.Equal(t, "invalid_voice_config", StreamJoinCodeInvalidVoiceConfig)
 }
 
 func TestSpec_Subscribe_ReportsTokenExpiring(t *testing.T) {

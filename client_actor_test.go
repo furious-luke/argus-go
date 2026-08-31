@@ -56,6 +56,17 @@ func (a *CustomerServerActor) Join(opts *JoinOptions) (*JoinResponse, error) {
 	return a.client.JoinStreamWithOptions(context.Background(), opts)
 }
 
+func (a *CustomerServerActor) MustRefreshPublisher(streamID string) *PublisherTokenResponse {
+	a.t.Helper()
+	response, err := a.client.RefreshPublisherToken(context.Background(), streamID)
+	require.NoError(a.t, err)
+	return response
+}
+
+func (a *CustomerServerActor) LastPublisherTokenAuthHeader() string {
+	return a.controlPlane.lastPublisherTokenAuth
+}
+
 // MustFetchFrame fetches a frame for the stream and fails the test on error.
 func (a *CustomerServerActor) MustFetchFrame(streamID, readToken string, opts *FrameOptions) []byte {
 	a.t.Helper()
@@ -634,13 +645,16 @@ func (a *NotifyGatewayActor) CancellationKeepsSingleWriter() bool {
 // fakeControlPlane stands in for argus-srv's POST /api/streams endpoint. It
 // captures the last request and serves a configurable response.
 type fakeControlPlane struct {
-	status         int
-	body           string
-	voicesStatus   int
-	voicesBody     string
-	lastBody       joinStreamBody
-	lastAuth       string
-	lastVoicesAuth string
+	status                 int
+	body                   string
+	voicesStatus           int
+	voicesBody             string
+	publisherStatus        int
+	publisherBody          string
+	lastBody               joinStreamBody
+	lastAuth               string
+	lastVoicesAuth         string
+	lastPublisherTokenAuth string
 }
 
 func newFakeControlPlane() *fakeControlPlane {
@@ -653,6 +667,8 @@ func newFakeControlPlane() *fakeControlPlane {
 		voicesBody: `{"version":"2026-08-31.1","voices":[{"name":"ava","label":"Ava","status":"active","providers":["elevenlabs","google"]}],` +
 			`"providers":[{"name":"google","status":"active","voices":[{"id":"Aoede","label":"Aoede — Breezy","status":"active","languages":["en-US"]}]}],` +
 			`"commonParams":[{"name":"speed","type":"number","min":0.5,"max":2,"default":1,"unit":"multiplier","providers":["elevenlabs","google"]}]}`,
+		publisherStatus: http.StatusOK,
+		publisherBody:   `{"token":"fresh-join-jwt","stream_id":"stream-1","expires_at":"2026-06-30T13:30:00Z","gateway_urls":["https://gw.example.com"]}`,
 	}
 }
 
@@ -670,6 +686,10 @@ func (f *fakeControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(raw, &f.lastBody)
 		w.WriteHeader(f.status)
 		_, _ = io.WriteString(w, f.body)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/streams/stream-1/publisher-token":
+		f.lastPublisherTokenAuth = r.Header.Get("Authorization")
+		w.WriteHeader(f.publisherStatus)
+		_, _ = io.WriteString(w, f.publisherBody)
 	default:
 		http.NotFound(w, r)
 	}

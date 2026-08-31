@@ -98,6 +98,53 @@ type UtteranceEvent struct {
 	TextComplete bool
 }
 
+// Stable terminal-reason values carried by a NotifyTerminalError. They mirror
+// the strings the Argus gateway emits on the wire, so integrations can classify
+// a terminal error — e.g. a credential refresh versus a transport redial —
+// against a named constant instead of an inline literal. Compare a reason
+// against these rather than hard-coding the string; the wire values are pinned
+// by TestSpec_NotifyReasons_PinWireValues on both sides of the boundary.
+const (
+	// NotifyReasonControlTokenExpired means the subscription's control token
+	// expired. Refresh the control token and reconnect.
+	NotifyReasonControlTokenExpired = "control token expired"
+	// NotifyReasonReadTokenExpired means the subscription's read token expired.
+	NotifyReasonReadTokenExpired = "read token expired"
+	// NotifyReasonMeshConnectionLost means an established internal connection to
+	// the owning media node dropped; redial.
+	NotifyReasonMeshConnectionLost = "mesh connection lost"
+	// NotifyReasonMeshConnectionUnavailable means the internal connection to the
+	// owning media node could not be established; redial.
+	NotifyReasonMeshConnectionUnavailable = "mesh connection unavailable"
+	// NotifyReasonGatewayShuttingDown means the regional gateway is draining;
+	// redial to land on another node.
+	NotifyReasonGatewayShuttingDown = "gateway shutting down"
+	// NotifyReasonStreamCommandQueueSaturated means the stream's command queue is
+	// overloaded; redial.
+	NotifyReasonStreamCommandQueueSaturated = "stream command queue saturated"
+	// NotifyReasonStreamNotLive means the target stream has no live media session.
+	NotifyReasonStreamNotLive = "stream not live"
+	// NotifyReasonSubscribeFailed means the subscribe attempt failed on the media
+	// node for a non-specific reason.
+	NotifyReasonSubscribeFailed = "subscribe failed"
+)
+
+// NotifyTerminalError is a terminal error message sent by the regional gateway.
+// Reason is a stable, machine-readable gateway reason; classify it against the
+// NotifyReason* constants (not by parsing Error's presentation text) to tell,
+// for example, a credential refresh from a transport redial.
+type NotifyTerminalError struct {
+	Reason string
+}
+
+func (e *NotifyTerminalError) Error() string {
+	return fmt.Sprintf("notify error: %s", e.Reason)
+}
+
+// NotifyTerminalReason returns the gateway's machine-readable terminal reason.
+// It lets integrations classify errors without depending on this concrete type.
+func (e *NotifyTerminalError) NotifyTerminalReason() string { return e.Reason }
+
 type NotifySubscription struct {
 	conn      *websocket.Conn
 	ctx       context.Context
@@ -370,7 +417,7 @@ func readNotifyConnection(ctx context.Context, conn *websocket.Conn, streamID st
 			}
 			return true, nil
 		case notifyMsgError:
-			return true, fmt.Errorf("notify error: %s", msg.Reason)
+			return true, &NotifyTerminalError{Reason: msg.Reason}
 		}
 	}
 }

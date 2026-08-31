@@ -38,6 +38,51 @@ type ControlTokenResponse struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
+// Stable stream-creation error codes carried by a StreamJoinError.Code. They
+// mirror the codes Argus emits on the wire, so callers can classify a rejection
+// against a named constant — notably to detect a stale voice catalogue and
+// refetch it — instead of hard-coding the literal. The wire values are pinned
+// by TestSpec_StreamJoinCodes_PinWireValues on both sides of the boundary.
+const (
+	// StreamJoinCodeStaleCatalogVersion means the request named a no-longer-current
+	// voice catalogue version. Refetch the catalogue and retry.
+	StreamJoinCodeStaleCatalogVersion = "stale_catalog_version"
+	// StreamJoinCodeInvalidVoiceConfig is the category for a rejected voice
+	// configuration whose specific reason is otherwise opaque to the caller.
+	StreamJoinCodeInvalidVoiceConfig = "invalid_voice_config"
+)
+
+// StreamJoinError describes a control-plane rejection of stream creation. Code
+// is the stable API error code when Argus supplied one (see StreamJoinCode*);
+// callers can safely distinguish a stale voice catalogue from failures whose
+// request outcome may be unknown (such as a transport timeout).
+type StreamJoinError struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *StreamJoinError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("create stream: unexpected status %d (%s): %s", e.StatusCode, e.Code, e.Message)
+	}
+	return fmt.Sprintf("create stream: unexpected status %d: %s", e.StatusCode, e.Message)
+}
+
+// StreamJoinErrorCode exposes the server's stable error code without coupling
+// consumers to this concrete error type.
+func (e *StreamJoinError) StreamJoinErrorCode() string { return e.Code }
+
+// PublisherTokenResponse is a browser-safe replacement join bundle for an
+// existing stream. It lets a new publisher take over without recreating the
+// stream and therefore preserves its immutable voice and STT configuration.
+type PublisherTokenResponse struct {
+	Token       string   `json:"token"`
+	StreamID    string   `json:"stream_id"`
+	ExpiresAt   string   `json:"expires_at"`
+	GatewayURLs []string `json:"gateway_urls"`
+}
+
 // JoinOptions configures a JoinStream request. A nil *JoinOptions selects an
 // eligible region automatically.
 type JoinOptions struct {
@@ -88,6 +133,30 @@ func (c *Client) RefreshControlToken(ctx context.Context, streamID string) (*Con
 		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(message))
 	}
 	var result ControlTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &result, nil
+}
+
+// RefreshPublisherToken mints a fresh browser join capability for an existing,
+// placed stream. It does not expose or rotate the server-only control token.
+func (c *Client) RefreshPublisherToken(ctx context.Context, streamID string) (*PublisherTokenResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/streams/"+streamID+"/publisher-token", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "ApiKey "+c.apiKey)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		message, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(message))
+	}
+	var result PublisherTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
@@ -145,7 +214,21 @@ func (c *Client) JoinStreamWithOptions(ctx context.Context, opts *JoinOptions) (
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		msg, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(msg))
+		var apiErr struct {
+			Error   string `json:"error"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(msg, &apiErr)
+		message := apiErr.Message
+		if message == "" {
+			message = string(msg)
+		}
+		code := apiErr.Code
+		if code == "" {
+			code = apiErr.Error
+		}
+		return nil, &StreamJoinError{StatusCode: resp.StatusCode, Code: code, Message: message}
 	}
 
 	var jr JoinResponse
