@@ -32,6 +32,16 @@ type CustomerServerActor struct {
 	retryDelays  []time.Duration
 }
 
+// MustGetVoices discovers the server-managed voice catalogue and fails the
+// test when the client cannot retrieve it. Discovery is setup for voice
+// configuration, so a failure here invalidates the spec using it.
+func (a *CustomerServerActor) MustGetVoices() *VoiceCatalog {
+	a.t.Helper()
+	catalog, err := a.client.GetVoices(context.Background())
+	require.NoError(a.t, err)
+	return catalog
+}
+
 // MustJoin creates a stream with the given options and fails the test on error.
 func (a *CustomerServerActor) MustJoin(opts *JoinOptions) *JoinResponse {
 	a.t.Helper()
@@ -73,6 +83,12 @@ func (a *CustomerServerActor) LastJoinRequest() joinStreamBody {
 // LastJoinAuthHeader returns the Authorization header the control plane last saw.
 func (a *CustomerServerActor) LastJoinAuthHeader() string {
 	return a.controlPlane.lastAuth
+}
+
+// LastVoiceCatalogAuthHeader returns the auth header received by the discovery
+// endpoint.
+func (a *CustomerServerActor) LastVoiceCatalogAuthHeader() string {
+	return a.controlPlane.lastVoicesAuth
 }
 
 // LastFrameRequest returns the path+query and bearer token the gateway last saw.
@@ -618,10 +634,13 @@ func (a *NotifyGatewayActor) CancellationKeepsSingleWriter() bool {
 // fakeControlPlane stands in for argus-srv's POST /api/streams endpoint. It
 // captures the last request and serves a configurable response.
 type fakeControlPlane struct {
-	status   int
-	body     string
-	lastBody joinStreamBody
-	lastAuth string
+	status         int
+	body           string
+	voicesStatus   int
+	voicesBody     string
+	lastBody       joinStreamBody
+	lastAuth       string
+	lastVoicesAuth string
 }
 
 func newFakeControlPlane() *fakeControlPlane {
@@ -630,18 +649,30 @@ func newFakeControlPlane() *fakeControlPlane {
 		body: `{"token":"join-jwt","stream_id":"stream-1",` +
 			`"expires_at":"2026-06-30T13:00:00Z","gateway_urls":["https://gw.example.com"],` +
 			`"control_token":"control-jwt","control_token_expires_at":"2026-06-30T14:00:00Z"}`,
+		voicesStatus: http.StatusOK,
+		voicesBody: `{"version":"2026-08-31.1","voices":[{"name":"ava","label":"Ava","status":"active","providers":["elevenlabs","google"]}],` +
+			`"providers":[{"name":"google","status":"active","voices":[{"id":"Aoede","label":"Aoede — Breezy","status":"active","languages":["en-US"]}]}],` +
+			`"commonParams":[{"name":"speed","type":"number","min":0.5,"max":2,"default":1,"unit":"multiplier","providers":["elevenlabs","google"]}]}`,
 	}
 }
 
 func (f *fakeControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	f.lastAuth = r.Header.Get("Authorization")
-	raw, _ := io.ReadAll(r.Body)
-	f.lastBody = joinStreamBody{}
-	_ = json.Unmarshal(raw, &f.lastBody)
-
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(f.status)
-	_, _ = io.WriteString(w, f.body)
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/api/voices":
+		f.lastVoicesAuth = r.Header.Get("Authorization")
+		w.WriteHeader(f.voicesStatus)
+		_, _ = io.WriteString(w, f.voicesBody)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/streams":
+		f.lastAuth = r.Header.Get("Authorization")
+		raw, _ := io.ReadAll(r.Body)
+		f.lastBody = joinStreamBody{}
+		_ = json.Unmarshal(raw, &f.lastBody)
+		w.WriteHeader(f.status)
+		_, _ = io.WriteString(w, f.body)
+	default:
+		http.NotFound(w, r)
+	}
 }
 
 // fakeGateway stands in for a regional frame gateway's GET /frames/{id}

@@ -63,6 +63,11 @@ type JoinOptions struct {
 	// processing region. It requires RecordingEnabled and must be a
 	// residency-compatible region with usable storage, else the create is rejected.
 	StorageRegion string
+	// Voice is the optional text-to-speech voice configuration for the stream. It
+	// is validated against the catalog and pinned at creation. Nil means the
+	// fleet-default voices. Discover valid selections with GetVoices. It is
+	// server-side only, like the transcription options.
+	Voice *VoiceConfig
 }
 
 // RefreshControlToken replaces an expiring control token. Once placement has
@@ -91,12 +96,13 @@ func (c *Client) RefreshControlToken(ctx context.Context, streamID string) (*Con
 
 // joinStreamBody mirrors the control plane's createStreamRequest JSON shape.
 type joinStreamBody struct {
-	Region                 string   `json:"region,omitempty"`
-	RecordingEnabled       bool     `json:"recording_enabled,omitempty"`
-	RecordingRetentionDays int      `json:"recording_retention_days,omitempty"`
-	StorageRegion          string   `json:"storage_region,omitempty"`
-	Language               string   `json:"language,omitempty"`
-	Keyterms               []string `json:"keyterms,omitempty"`
+	Region                 string       `json:"region,omitempty"`
+	RecordingEnabled       bool         `json:"recording_enabled,omitempty"`
+	RecordingRetentionDays int          `json:"recording_retention_days,omitempty"`
+	StorageRegion          string       `json:"storage_region,omitempty"`
+	Language               string       `json:"language,omitempty"`
+	Keyterms               []string     `json:"keyterms,omitempty"`
+	Voice                  *VoiceConfig `json:"voice,omitempty"`
 }
 
 // JoinStream creates a new stream with default options and returns its join
@@ -116,6 +122,7 @@ func (c *Client) JoinStreamWithOptions(ctx context.Context, opts *JoinOptions) (
 		body.StorageRegion = opts.StorageRegion
 		body.Language = opts.Language
 		body.Keyterms = opts.Keyterms
+		body.Voice = opts.Voice
 	}
 
 	payload, err := json.Marshal(body)

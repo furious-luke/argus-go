@@ -53,6 +53,27 @@ func TestSpec_Join_ForwardsRecordingOptions(t *testing.T) {
 	assert.Equal(t, "eu-central-1", req.StorageRegion, "storage-at-rest region is pinned independently of the processing region")
 }
 
+func TestSpec_Join_ForwardsServerSelectedVoiceConfiguration(t *testing.T) {
+	server := newArranger(t).CustomerServer()
+	server.MustJoin(&JoinOptions{Voice: &VoiceConfig{CatalogVersion: "2026-08-31.1", ByProvider: map[string]VoiceProviderRef{"google": {VoiceID: "Aoede"}}}})
+
+	assert.Equal(t, "Aoede", server.LastJoinRequest().Voice.ByProvider["google"].VoiceID)
+}
+
+func TestSpec_Voices_DiscoversTheCurrentCatalogue(t *testing.T) {
+	server := newArranger(t).CustomerServer()
+	catalog := server.MustGetVoices()
+
+	assert.Equal(t, "Aoede", catalog.Providers[0].Voices[0].ID)
+}
+
+func TestSpec_Voices_AuthenticatesDiscoveryWithTheAPIKey(t *testing.T) {
+	server := newArranger(t).CustomerServer()
+	server.MustGetVoices()
+
+	assert.Equal(t, "ApiKey "+defaultAPIKey, server.LastVoiceCatalogAuthHeader())
+}
+
 // Recording is off and no storage region is pinned unless explicitly requested,
 // so the fields are omitted from the create request by default.
 func TestSpec_Join_OmitsRecordingByDefault(t *testing.T) {
