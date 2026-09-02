@@ -60,8 +60,10 @@ type NotifyHandlers struct {
 	// it to stop talking and yield the turn.
 	OnSpeechStarted func()
 	// OnTranscript fires with a complete utterance. Only final transcripts are
-	// delivered — interim/partial text is never sent.
-	OnTranscript func(text string)
+	// delivered — interim/partial text is never sent. transcriptionID is the
+	// transcript's per-stream id, matching the transcription_timing diagnostics
+	// trace for the same transcript.
+	OnTranscript func(text string, transcriptionID uint64)
 	// OnNoSpeech fires when an utterance produced no usable text (silence, noise,
 	// unintelligible audio), so a voice agent can resume speaking.
 	OnNoSpeech func()
@@ -375,7 +377,7 @@ func readNotifyConnection(ctx context.Context, conn *websocket.Conn, streamID st
 			}
 		case notifyMsgTranscript:
 			if handlers.OnTranscript != nil {
-				handlers.OnTranscript(msg.Text)
+				handlers.OnTranscript(msg.Text, msg.TranscriptionID)
 			}
 		case notifyMsgNoSpeech:
 			if handlers.OnNoSpeech != nil {
@@ -449,20 +451,21 @@ func notifyHandshakeError(resp *http.Response, dialErr error) error {
 // notifyWire mirrors the gateway's notify.Message JSON. Kept local so the client
 // module stays free of an internal-package dependency.
 type notifyWire struct {
-	Type         string  `json:"type"`
-	Stream       string  `json:"stream,omitempty"`
-	Track        string  `json:"track,omitempty"`
-	SSIMScore    float64 `json:"ssim_score,omitempty"`
-	FrameFormat  string  `json:"frame_format,omitempty"`
-	FrameBase64  string  `json:"frame_base64,omitempty"`
-	Timestamp    string  `json:"timestamp,omitempty"`
-	Text         string  `json:"text,omitempty"`
-	Reason       string  `json:"reason,omitempty"`
-	UtteranceID  string  `json:"utterance_id,omitempty"`
-	MessageID    string  `json:"message_id,omitempty"`
-	Scope        string  `json:"scope,omitempty"`
-	DeliveryMode string  `json:"delivery_mode,omitempty"`
-	TextComplete *bool   `json:"text_complete,omitempty"`
+	Type            string  `json:"type"`
+	Stream          string  `json:"stream,omitempty"`
+	Track           string  `json:"track,omitempty"`
+	SSIMScore       float64 `json:"ssim_score,omitempty"`
+	FrameFormat     string  `json:"frame_format,omitempty"`
+	FrameBase64     string  `json:"frame_base64,omitempty"`
+	Timestamp       string  `json:"timestamp,omitempty"`
+	Text            string  `json:"text,omitempty"`
+	Reason          string  `json:"reason,omitempty"`
+	UtteranceID     string  `json:"utterance_id,omitempty"`
+	MessageID       string  `json:"message_id,omitempty"`
+	Scope           string  `json:"scope,omitempty"`
+	DeliveryMode    string  `json:"delivery_mode,omitempty"`
+	TextComplete    *bool   `json:"text_complete,omitempty"`
+	TranscriptionID uint64  `json:"transcription_id,omitempty"`
 }
 
 const (

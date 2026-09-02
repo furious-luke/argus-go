@@ -393,7 +393,7 @@ func (a *NotifyGatewayActor) handlers() NotifyHandlers {
 			defer a.mu.Unlock()
 			a.speechStarted++
 		},
-		OnTranscript: func(text string) {
+		OnTranscript: func(text string, _ uint64) {
 			a.mu.Lock()
 			defer a.mu.Unlock()
 			a.transcripts = append(a.transcripts, text)
@@ -446,7 +446,7 @@ func (a *NotifyGatewayActor) Subscribe(ctx context.Context, opts *NotifyOptions)
 // public client contract for suppressing video watcher work.
 func (a *NotifyGatewayActor) SubscribeTranscriptsOnly(ctx context.Context) error {
 	return a.client.Subscribe(ctx, a.gatewayURL, "stream-1", "control-jwt", nil, NotifyHandlers{
-		OnTranscript: func(string) {},
+		OnTranscript: func(string, uint64) {},
 	})
 }
 

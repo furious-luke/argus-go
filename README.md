@@ -172,8 +172,10 @@ go func() {
             OnFrame: func(ev argus.NotifyEvent) {
                 // ev.StreamID, ev.Track, ev.SSIMScore, ev.FrameFormat, ev.Frame ...
             },
-            OnTranscript: func(text string) {
+            OnTranscript: func(text string, transcriptionID uint64) {
                 // A complete (final) utterance from the microphone track.
+                // transcriptionID correlates this transcript with its
+                // transcription_timing diagnostics trace.
             },
             OnTokenExpiring: func() {
                 // The control token is near expiry. RefreshControlToken mints a
@@ -203,7 +205,7 @@ server to skip its video watcher. The transcription handlers are all optional:
 | Handler | Fires when |
 | --- | --- |
 | `OnSpeechStarted` | The speaker began talking (stop speaking, yield the turn). |
-| `OnTranscript(text)` | A **complete** utterance is ready (final only — no interim text). |
+| `OnTranscript(text, transcriptionID)` | A **complete** utterance is ready (final only — no interim text). `transcriptionID` is the per-stream transcript id, matching its `transcription_timing` diagnostics trace. |
 | `OnNoSpeech` | An utterance produced no usable text (silence/noise). |
 | `OnTranscriptionInterrupted` | **Recoverable** break; ask the speaker to repeat once input resumes. |
 | `OnTranscriptionUnavailable` | **Terminal** break; transcription will not resume for this stream. |
