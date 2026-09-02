@@ -664,9 +664,9 @@ func newFakeControlPlane() *fakeControlPlane {
 			`"expires_at":"2026-06-30T13:00:00Z","gateway_urls":["https://gw.example.com"],` +
 			`"control_token":"control-jwt","control_token_expires_at":"2026-06-30T14:00:00Z"}`,
 		voicesStatus: http.StatusOK,
-		voicesBody: `{"version":"2026-08-31.1","voices":[{"name":"ava","label":"Ava","status":"active","providers":["elevenlabs","google"]}],` +
-			`"providers":[{"name":"google","status":"active","voices":[{"id":"Aoede","label":"Aoede — Breezy","status":"active","languages":["en-US"]}]}],` +
-			`"commonParams":[{"name":"speed","type":"number","min":0.5,"max":2,"default":1,"unit":"multiplier","providers":["elevenlabs","google"]}]}`,
+		voicesBody: `{"version":"2026-08-31.1","voices":[{"name":"ava","label":"Ava","status":"active","providers":["elevenlabs","gemini-tts"]}],` +
+			`"providers":[{"name":"gemini-tts","status":"active","voices":[{"id":"Aoede","label":"Aoede — Breezy","status":"active","languages":["en-US"]}]}],` +
+			`"commonParams":[{"name":"speed","type":"number","min":0.5,"max":2,"default":1,"unit":"multiplier","providers":["elevenlabs","gemini-tts"]}]}`,
 		publisherStatus: http.StatusOK,
 		publisherBody:   `{"token":"fresh-join-jwt","stream_id":"stream-1","expires_at":"2026-06-30T13:30:00Z","gateway_urls":["https://gw.example.com"]}`,
 	}

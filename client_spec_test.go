@@ -65,9 +65,9 @@ func TestSpec_Join_ForwardsRecordingOptions(t *testing.T) {
 
 func TestSpec_Join_ForwardsServerSelectedVoiceConfiguration(t *testing.T) {
 	server := newArranger(t).CustomerServer()
-	server.MustJoin(&JoinOptions{Voice: &VoiceConfig{CatalogVersion: "2026-08-31.1", ByProvider: map[string]VoiceProviderRef{"google": {VoiceID: "Aoede"}}}})
+	server.MustJoin(&JoinOptions{Voice: &VoiceConfig{CatalogVersion: "2026-08-31.1", ByProvider: map[string]VoiceProviderRef{"gemini-tts": {VoiceID: "Aoede"}}}})
 
-	assert.Equal(t, "Aoede", server.LastJoinRequest().Voice.ByProvider["google"].VoiceID)
+	assert.Equal(t, "Aoede", server.LastJoinRequest().Voice.ByProvider["gemini-tts"].VoiceID)
 }
 
 func TestSpec_Voices_DiscoversTheCurrentCatalogue(t *testing.T) {
