@@ -345,6 +345,10 @@ func (a *NotifyGatewayActor) EnqueueTranscript(text string) {
 	a.gateway.enqueue(notifyWire{Type: notifyMsgTranscript, Text: text})
 }
 
+func (a *NotifyGatewayActor) enqueueTranscriptWithID(text string, transcriptionID uint64) {
+	a.gateway.enqueue(notifyWire{Type: notifyMsgTranscript, Text: text, TranscriptionID: transcriptionID})
+}
+
 // EnqueueNoSpeech queues a no_speech message.
 func (a *NotifyGatewayActor) EnqueueNoSpeech() {
 	a.gateway.enqueue(notifyWire{Type: notifyMsgNoSpeech})
@@ -546,6 +550,31 @@ func (a *NotifyGatewayActor) StreamUtterance(ctx context.Context, id string, chu
 	want := len(chunks) + 2
 	for range 100 {
 		if len(a.gateway.receivedMessages()) >= want {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_ = subscription.Close()
+	return a.gateway.receivedMessages()
+}
+
+func (a *NotifyGatewayActor) StreamCorrelatedUtterance(ctx context.Context, id string, transcriptionID uint64, timing ApplicationTurnTiming) []notifyWire {
+	a.t.Helper()
+	a.enqueueTranscriptWithID("trigger", transcriptionID)
+	received := make(chan struct{})
+	subscription, err := a.client.OpenNotify(ctx, a.gatewayURL, "stream-1", "control-jwt", nil, NotifyHandlers{OnTranscript: func(string, uint64) { close(received) }})
+	require.NoError(a.t, err)
+	select {
+	case <-received:
+	case <-ctx.Done():
+		a.t.Fatal("correlated transcript was not delivered")
+	}
+	time.Sleep(2 * time.Millisecond)
+	require.NoError(a.t, subscription.StartUtteranceForTranscript(id, transcriptionID, &timing))
+	require.NoError(a.t, subscription.SendUtteranceText(id, "complete response"))
+	require.NoError(a.t, subscription.EndUtteranceWithTiming(id, &timing))
+	for range 100 {
+		if len(a.gateway.receivedMessages()) >= 3 {
 			break
 		}
 		time.Sleep(time.Millisecond)

@@ -226,6 +226,29 @@ unique within a subscription, limited to 128 UTF-8 bytes, and capped at 4,096
 accepted IDs per subscription. Text chunks are limited to 4 KiB and an utterance
 to 64 KiB.
 
+For per-turn latency attribution, retain the `transcriptionID` supplied to
+`OnTranscript` and start its reply with
+`StartUtteranceForTranscript(id, transcriptionID, timing)`. `timing` is an
+optional `ApplicationTurnTiming` containing monotonic durations such as model
+queue, model TTFT, model generation, response buffering, and total work. The Go
+client fills dispatch automatically from entry to `OnTranscript` until the
+correlated start is written.
+Send the completed breakdown with `EndUtteranceWithTiming`. Argus combines it
+with gateway-clock and media-clock spans; it never compares wall clocks across
+regions.
+
+```go
+timing := &argus.ApplicationTurnTiming{
+    ModelTTFT:      modelTTFT,
+    ModelTotal:     modelTotal,
+    ResponseBuffer: responseBuffer,
+    Total:          time.Since(transcriptReceived),
+}
+sub.StartUtteranceForTranscript(id, transcriptionID, timing)
+sub.SendUtteranceText(id, completeResponse)
+sub.EndUtteranceWithTiming(id, timing)
+```
+
 ## Errors
 
 `JoinStream*`, `FetchFrame`, and `Subscribe` return wrapped errors. Frame and

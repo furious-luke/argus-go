@@ -261,6 +261,23 @@ func TestSpec_NotifySubscription_StreamsIdentifiedUtteranceCommands(t *testing.T
 	assert.Equal(t, notifyMsgUtteranceEnd, messages[3].Type)
 }
 
+func TestSpec_NotifySubscription_CorrelatesReplyAndReportsApplicationDurations(t *testing.T) {
+	gateway := newArranger(t).NotifyGateway()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	messages := gateway.StreamCorrelatedUtterance(ctx, "u-correlated", 27, ApplicationTurnTiming{
+		ModelTTFT:  90 * time.Millisecond,
+		ModelTotal: 350 * time.Millisecond, ResponseBuffer: 70 * time.Millisecond, Total: 420 * time.Millisecond,
+	})
+	require.Len(t, messages, 3)
+	assert.Equal(t, uint64(27), messages[0].TranscriptionID)
+	require.NotNil(t, messages[0].ApplicationTiming)
+	assert.Positive(t, messages[0].ApplicationTiming.DispatchMs, "the client measures callback-to-start dispatch on its own clock")
+	require.NotNil(t, messages[2].ApplicationTiming)
+	assert.Equal(t, int64(90), messages[2].ApplicationTiming.ModelTTFTMs)
+	assert.Equal(t, int64(70), messages[2].ApplicationTiming.ResponseBufferMs)
+}
+
 func TestSpec_NotifySubscription_StalledCommandWriteReturnsWithinTransportBound(t *testing.T) {
 	gateway := newArranger(t).NotifyGateway()
 	assert.True(t, gateway.StalledCommandReturnsWithinBound())

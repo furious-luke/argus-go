@@ -100,6 +100,22 @@ type UtteranceEvent struct {
 	TextComplete bool
 }
 
+// ApplicationTurnTiming describes where a customer application spent time
+// between receiving a final transcript and returning the correlated reply.
+// Every field is a duration measured on the application's monotonic clock.
+type ApplicationTurnTiming struct {
+	// Dispatch is populated automatically by StartUtteranceForTranscript from the
+	// transcript callback to the command write. A supplied value is used only
+	// when the client did not observe that transcript (for example after a handoff).
+	Dispatch        time.Duration
+	ModelQueue      time.Duration
+	ModelTTFT       time.Duration
+	ModelGeneration time.Duration
+	ModelTotal      time.Duration
+	ResponseBuffer  time.Duration
+	Total           time.Duration
+}
+
 // Stable terminal-reason values carried by a NotifyTerminalError. They mirror
 // the strings the Argus gateway emits on the wire, so integrations can classify
 // a terminal error — e.g. a credential refresh versus a transport redial —
@@ -155,12 +171,18 @@ type NotifySubscription struct {
 	errMu     sync.Mutex
 	err       error
 	closeOnce sync.Once
+	turnMu    sync.Mutex
+	// transcriptAnchors measures callback-to-reply dispatch on this process's
+	// monotonic clock. It is bounded to recent interactive turns.
+	transcriptAnchors map[uint64]time.Time
+	transcriptOrder   []uint64
 	// afterWriteCancel is a test-only completion barrier for the cancellation
 	// callback installed around a blocked write. Nil in production.
 	afterWriteCancel func()
 }
 
 const notifyWriteTimeout = time.Second
+const notifyTranscriptAnchorLimit = 64
 
 func (s *NotifySubscription) Done() <-chan struct{} { return s.done }
 
@@ -206,7 +228,51 @@ func (s *NotifySubscription) send(message notifyWire) error {
 }
 
 func (s *NotifySubscription) StartUtterance(utteranceID string) error {
-	return s.send(notifyWire{Type: notifyMsgUtteranceStart, UtteranceID: utteranceID})
+	return s.StartUtteranceForTranscript(utteranceID, 0, nil)
+}
+
+// StartUtteranceForTranscript starts a reply correlated to the final transcript
+// that triggered it. timing may contain the work completed before dispatch;
+// callers can supply the fuller breakdown again on EndUtteranceWithTiming.
+func (s *NotifySubscription) StartUtteranceForTranscript(utteranceID string, transcriptionID uint64, timing *ApplicationTurnTiming) error {
+	wireTiming := applicationTimingWire(timing)
+	if dispatch, ok := s.consumeTranscriptAnchor(transcriptionID); ok {
+		if wireTiming == nil {
+			wireTiming = &applicationTurnTimingWire{}
+		}
+		wireTiming.DispatchMs = time.Since(dispatch).Milliseconds()
+	}
+	return s.send(notifyWire{Type: notifyMsgUtteranceStart, UtteranceID: utteranceID, TranscriptionID: transcriptionID, ApplicationTiming: wireTiming})
+}
+
+func (s *NotifySubscription) recordTranscriptAnchor(id uint64, at time.Time) {
+	if id == 0 {
+		return
+	}
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.transcriptAnchors == nil {
+		s.transcriptAnchors = make(map[uint64]time.Time)
+	}
+	if _, exists := s.transcriptAnchors[id]; !exists {
+		s.transcriptOrder = append(s.transcriptOrder, id)
+	}
+	s.transcriptAnchors[id] = at
+	for len(s.transcriptOrder) > notifyTranscriptAnchorLimit {
+		delete(s.transcriptAnchors, s.transcriptOrder[0])
+		s.transcriptOrder = s.transcriptOrder[1:]
+	}
+}
+
+func (s *NotifySubscription) consumeTranscriptAnchor(id uint64) (time.Time, bool) {
+	if id == 0 {
+		return time.Time{}, false
+	}
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	at, ok := s.transcriptAnchors[id]
+	delete(s.transcriptAnchors, id)
+	return at, ok
 }
 
 func (s *NotifySubscription) SendUtteranceText(utteranceID, text string) error {
@@ -214,7 +280,35 @@ func (s *NotifySubscription) SendUtteranceText(utteranceID, text string) error {
 }
 
 func (s *NotifySubscription) EndUtterance(utteranceID string) error {
-	return s.send(notifyWire{Type: notifyMsgUtteranceEnd, UtteranceID: utteranceID})
+	return s.EndUtteranceWithTiming(utteranceID, nil)
+}
+
+// EndUtteranceWithTiming closes the input and reports the application's final
+// duration breakdown. Argus treats these as customer-measured diagnostics.
+func (s *NotifySubscription) EndUtteranceWithTiming(utteranceID string, timing *ApplicationTurnTiming) error {
+	return s.send(notifyWire{Type: notifyMsgUtteranceEnd, UtteranceID: utteranceID, ApplicationTiming: applicationTimingWire(timing)})
+}
+
+func applicationTimingWire(timing *ApplicationTurnTiming) *applicationTurnTimingWire {
+	if timing == nil {
+		return nil
+	}
+	return &applicationTurnTimingWire{
+		DispatchMs:        durationMs(timing.Dispatch),
+		ModelQueueMs:      durationMs(timing.ModelQueue),
+		ModelTTFTMs:       durationMs(timing.ModelTTFT),
+		ModelGenerationMs: durationMs(timing.ModelGeneration),
+		ModelTotalMs:      durationMs(timing.ModelTotal),
+		ResponseBufferMs:  durationMs(timing.ResponseBuffer),
+		TotalMs:           durationMs(timing.Total),
+	}
+}
+
+func durationMs(value time.Duration) int64 {
+	if value <= 0 {
+		return 0
+	}
+	return value.Milliseconds()
 }
 
 func (s *NotifySubscription) CancelUtterance(utteranceID string) error {
@@ -312,7 +406,14 @@ func (c *Client) OpenNotify(ctx context.Context, gatewayURL, streamID, controlTo
 	if err != nil {
 		return nil, notifyHandshakeError(response, err)
 	}
-	subscription := &NotifySubscription{conn: conn, ctx: ctx, done: make(chan struct{})}
+	subscription := &NotifySubscription{conn: conn, ctx: ctx, done: make(chan struct{}), transcriptAnchors: make(map[uint64]time.Time)}
+	originalTranscriptHandler := handlers.OnTranscript
+	handlers.OnTranscript = func(text string, transcriptionID uint64) {
+		subscription.recordTranscriptAnchor(transcriptionID, time.Now())
+		if originalTranscriptHandler != nil {
+			originalTranscriptHandler(text, transcriptionID)
+		}
+	}
 	go func() {
 		_, readErr := readNotifyConnection(ctx, conn, streamID, handlers)
 		subscription.errMu.Lock()
@@ -451,21 +552,32 @@ func notifyHandshakeError(resp *http.Response, dialErr error) error {
 // notifyWire mirrors the gateway's notify.Message JSON. Kept local so the client
 // module stays free of an internal-package dependency.
 type notifyWire struct {
-	Type            string  `json:"type"`
-	Stream          string  `json:"stream,omitempty"`
-	Track           string  `json:"track,omitempty"`
-	SSIMScore       float64 `json:"ssim_score,omitempty"`
-	FrameFormat     string  `json:"frame_format,omitempty"`
-	FrameBase64     string  `json:"frame_base64,omitempty"`
-	Timestamp       string  `json:"timestamp,omitempty"`
-	Text            string  `json:"text,omitempty"`
-	Reason          string  `json:"reason,omitempty"`
-	UtteranceID     string  `json:"utterance_id,omitempty"`
-	MessageID       string  `json:"message_id,omitempty"`
-	Scope           string  `json:"scope,omitempty"`
-	DeliveryMode    string  `json:"delivery_mode,omitempty"`
-	TextComplete    *bool   `json:"text_complete,omitempty"`
-	TranscriptionID uint64  `json:"transcription_id,omitempty"`
+	Type              string                     `json:"type"`
+	Stream            string                     `json:"stream,omitempty"`
+	Track             string                     `json:"track,omitempty"`
+	SSIMScore         float64                    `json:"ssim_score,omitempty"`
+	FrameFormat       string                     `json:"frame_format,omitempty"`
+	FrameBase64       string                     `json:"frame_base64,omitempty"`
+	Timestamp         string                     `json:"timestamp,omitempty"`
+	Text              string                     `json:"text,omitempty"`
+	Reason            string                     `json:"reason,omitempty"`
+	UtteranceID       string                     `json:"utterance_id,omitempty"`
+	MessageID         string                     `json:"message_id,omitempty"`
+	Scope             string                     `json:"scope,omitempty"`
+	DeliveryMode      string                     `json:"delivery_mode,omitempty"`
+	TextComplete      *bool                      `json:"text_complete,omitempty"`
+	TranscriptionID   uint64                     `json:"transcription_id,omitempty"`
+	ApplicationTiming *applicationTurnTimingWire `json:"application_timing,omitempty"`
+}
+
+type applicationTurnTimingWire struct {
+	DispatchMs        int64 `json:"dispatch_ms,omitempty"`
+	ModelQueueMs      int64 `json:"model_queue_ms,omitempty"`
+	ModelTTFTMs       int64 `json:"model_ttft_ms,omitempty"`
+	ModelGenerationMs int64 `json:"model_generation_ms,omitempty"`
+	ModelTotalMs      int64 `json:"model_total_ms,omitempty"`
+	ResponseBufferMs  int64 `json:"response_buffer_ms,omitempty"`
+	TotalMs           int64 `json:"total_ms,omitempty"`
 }
 
 const (
