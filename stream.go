@@ -50,6 +50,10 @@ const (
 	// StreamJoinCodeInvalidVoiceConfig is the category for a rejected voice
 	// configuration whose specific reason is otherwise opaque to the caller.
 	StreamJoinCodeInvalidVoiceConfig = "invalid_voice_config"
+	// StreamJoinCodeInvalidTranscriptionConfig means the request named a
+	// transcription provider the fleet has not deployed. Discover the available
+	// providers with GetTranscriptionProviders and retry with a valid subset.
+	StreamJoinCodeInvalidTranscriptionConfig = "invalid_transcription_config"
 )
 
 // StreamJoinError describes a control-plane rejection of stream creation. Code
@@ -96,6 +100,14 @@ type JoinOptions struct {
 	// Keyterms boost recognition of domain vocabulary during transcription.
 	// Server-side only, like Language.
 	Keyterms []string
+	// TranscriptionProviders is the optional per-stream preferred speech-to-text
+	// provider order (primary first), e.g. {"openai"}. It must name providers the
+	// fleet has deployed — discover them with GetTranscriptionProviders — and is
+	// validated at creation (an unavailable provider is rejected). The media server
+	// leads transcription with these and appends the remaining fleet providers as
+	// fallback. Empty defers entirely to the fleet's configured chain. Server-side
+	// only, like Language.
+	TranscriptionProviders []string
 	// RecordingEnabled opts this stream into recording to object storage for later
 	// review (separate video/mic/speech tracks tied to one timeline by a manifest).
 	// It is not part of the live read path.
@@ -171,6 +183,7 @@ type joinStreamBody struct {
 	StorageRegion          string       `json:"storage_region,omitempty"`
 	Language               string       `json:"language,omitempty"`
 	Keyterms               []string     `json:"keyterms,omitempty"`
+	TranscriptionProviders []string     `json:"transcription_providers,omitempty"`
 	Voice                  *VoiceConfig `json:"voice,omitempty"`
 }
 
@@ -191,6 +204,7 @@ func (c *Client) JoinStreamWithOptions(ctx context.Context, opts *JoinOptions) (
 		body.StorageRegion = opts.StorageRegion
 		body.Language = opts.Language
 		body.Keyterms = opts.Keyterms
+		body.TranscriptionProviders = opts.TranscriptionProviders
 		body.Voice = opts.Voice
 	}
 

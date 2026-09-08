@@ -120,3 +120,36 @@ func (c *Client) GetVoices(ctx context.Context) (*VoiceCatalog, error) {
 	}
 	return &catalog, nil
 }
+
+// TranscriptionProviders is the fleet's speech-to-text provider chain, primary
+// first. Any subset may be named in JoinOptions.TranscriptionProviders to prefer
+// those providers for a stream.
+type TranscriptionProviders struct {
+	Version   string   `json:"version"`
+	Providers []string `json:"providers"`
+}
+
+// GetTranscriptionProviders fetches the fleet's available speech-to-text
+// providers for the calling account, for choosing a stream's
+// JoinOptions.TranscriptionProviders preference.
+func (c *Client) GetTranscriptionProviders(ctx context.Context) (*TranscriptionProviders, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/transcription-providers", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "ApiKey "+c.apiKey)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		message, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(message))
+	}
+	var providers TranscriptionProviders
+	if err := json.NewDecoder(resp.Body).Decode(&providers); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &providers, nil
+}
