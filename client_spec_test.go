@@ -261,6 +261,20 @@ func TestSpec_NotifySubscription_StreamsIdentifiedUtteranceCommands(t *testing.T
 	assert.Equal(t, notifyMsgUtteranceEnd, messages[3].Type)
 }
 
+func TestSpec_NotifySubscription_ConfiguresLegacyPromptAndFullToolSurface(t *testing.T) {
+	gateway := newArranger(t).NotifyGateway()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	messages := gateway.ConfigureAgent(ctx)
+
+	require.Len(t, messages, 2)
+	assert.Equal(t, "legacy prompt", messages[0].Instructions)
+	assert.Empty(t, messages[0].Tools)
+	assert.Equal(t, "lookup", messages[1].Tools[0].Name)
+	assert.Equal(t, "required", messages[1].ToolChoice)
+	assert.Equal(t, 250, messages[1].ToolTimeoutMs)
+}
+
 func TestSpec_NotifySubscription_CorrelatesReplyAndReportsApplicationDurations(t *testing.T) {
 	gateway := newArranger(t).NotifyGateway()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -364,6 +378,50 @@ func TestSpec_NotifyReasons_PinWireValues(t *testing.T) {
 	assert.Equal(t, "stream command queue saturated", NotifyReasonStreamCommandQueueSaturated)
 	assert.Equal(t, "stream not live", NotifyReasonStreamNotLive)
 	assert.Equal(t, "subscribe failed", NotifyReasonSubscribeFailed)
+	assert.Equal(t, "tool call timed out", AgentToolFailureReasonTimeout)
+	assert.Equal(t, "provider session lost during tool call", AgentToolFailureReasonSessionLost)
+}
+
+// TestSpec_Subscribe_DispatchesParallelToolCallsIndependently verifies a
+// synchronous customer tool handler cannot occupy the sole notify reader and
+// starve another parallel tool call behind it.
+func TestSpec_Subscribe_DispatchesParallelToolCallsIndependently(t *testing.T) {
+	gateway := newArranger(t).NotifyGateway()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	assert.True(t, gateway.ToolCallsDispatchIndependently(ctx))
+}
+
+func TestSpec_NotifySubscription_DefersToolDispatcherResourcesUntilFirstCall(t *testing.T) {
+	gateway := newArranger(t).NotifyGateway()
+	assert.True(t, gateway.ToolDispatcherResourcesAreLazy())
+}
+
+func TestSpec_Subscribe_DeliversToolFailureOutcome(t *testing.T) {
+	gateway := newArranger(t).NotifyGateway()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	assert.Equal(t, AgentToolFailure{CallID: "call_1", Reason: AgentToolFailureReasonTimeout},
+		gateway.ObserveToolFailure(ctx, "call_1", AgentToolFailureReasonTimeout))
+}
+
+func TestSpec_Subscribe_DeliversToolFailureWhileCallCallbackRuns(t *testing.T) {
+	for _, reason := range []string{AgentToolFailureReasonTimeout, AgentToolFailureReasonSessionLost} {
+		t.Run(reason, func(t *testing.T) {
+			gateway := newArranger(t).NotifyGateway()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			assert.True(t, gateway.ToolFailureArrivesWhileCallRuns(ctx, reason))
+		})
+	}
+}
+
+func TestSpec_NotifySubscription_CloseCompletesWithSaturatedToolHandlers(t *testing.T) {
+	gateway := newArranger(t).NotifyGateway()
+
+	assert.True(t, gateway.CloseWithSaturatedToolHandlers())
 }
 
 // TestSpec_StreamJoinCodes_PinWireValues locks the stream-creation error codes

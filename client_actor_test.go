@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -19,6 +20,18 @@ import (
 )
 
 const defaultAPIKey = "argus_api_key_test"
+
+func recvWithin[T any](t *testing.T, ch <-chan T, label string) T {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+		var zero T
+		return zero
+	}
+}
 
 // CustomerServerActor drives a Client against a fake control plane and frame
 // gateway, standing in for a customer's own backend. The captured requests on
@@ -320,6 +333,15 @@ func (a *NotifyGatewayActor) EnqueueTokenExpiring() {
 	a.gateway.enqueue(notifyWire{Type: notifyMsgTokenExpiring})
 }
 
+// EnqueueAgentToolCall queues one provider tool request for the customer SDK.
+func (a *NotifyGatewayActor) EnqueueAgentToolCall(callID string) {
+	a.gateway.enqueue(notifyWire{Type: notifyMsgAgentToolCall, Stream: "stream-1", CallID: callID, ToolName: "tool"})
+}
+
+func (a *NotifyGatewayActor) EnqueueAgentToolFailure(callID, reason string) {
+	a.gateway.enqueue(notifyWire{Type: notifyMsgAgentToolFailed, Stream: "stream-1", CallID: callID, Reason: reason})
+}
+
 // EnqueueStreamEnded queues a stream_ended message.
 func (a *NotifyGatewayActor) EnqueueStreamEnded() {
 	a.gateway.enqueue(notifyWire{Type: notifyMsgStreamEnded})
@@ -454,6 +476,159 @@ func (a *NotifyGatewayActor) SubscribeTranscriptsOnly(ctx context.Context) error
 	})
 }
 
+// ToolCallsDispatchIndependently holds the first tool callback open and reports
+// whether a second call is dispatched before it returns. This models normal
+// synchronous customer tool functions without letting one block the socket reader.
+func (a *NotifyGatewayActor) ToolCallsDispatchIndependently(ctx context.Context) bool {
+	a.t.Helper()
+	a.EnqueueAgentToolCall("call_1")
+	a.EnqueueAgentToolCall("call_2")
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan struct{})
+	firstDone := make(chan struct{})
+	subscription, err := a.client.OpenNotify(ctx, a.gatewayURL, "stream-1", "control-jwt", nil, NotifyHandlers{
+		OnAgentToolCall: func(call AgentToolCall) {
+			switch call.CallID {
+			case "call_1":
+				close(firstStarted)
+				<-releaseFirst
+				close(firstDone)
+			case "call_2":
+				close(secondStarted)
+			}
+		},
+	})
+	require.NoError(a.t, err)
+	defer subscription.Close()
+	require.Eventually(a.t, func() bool {
+		select {
+		case <-firstStarted:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+
+	independent := false
+	select {
+	case <-secondStarted:
+		independent = true
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(releaseFirst)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		a.t.Fatal("first tool callback did not finish")
+	}
+	return independent
+}
+
+// ToolDispatcherResourcesAreLazy observes the otherwise invisible idle cost of
+// a tool-capable subscription: before its first event there must be no callback
+// queue and no dispatcher execution goroutines.
+func (a *NotifyGatewayActor) ToolDispatcherResourcesAreLazy() bool {
+	a.t.Helper()
+	workersBefore := toolDispatcherWorkerGoroutines()
+	d := newToolCallDispatcher(context.Background(), func(AgentToolCall) {}, func(AgentToolFailure) {})
+	defer d.close()
+	time.Sleep(20 * time.Millisecond)
+	return d.jobs == nil && toolDispatcherWorkerGoroutines() == workersBefore
+}
+
+func toolDispatcherWorkerGoroutines() int {
+	buffer := make([]byte, 1<<20)
+	n := runtime.Stack(buffer, true)
+	return strings.Count(string(buffer[:n]), "(*toolCallDispatcher).run")
+}
+
+func (a *NotifyGatewayActor) ObserveToolFailure(ctx context.Context, callID, reason string) AgentToolFailure {
+	a.t.Helper()
+	a.EnqueueAgentToolFailure(callID, reason)
+	received := make(chan AgentToolFailure, 1)
+	subscription, err := a.client.OpenNotify(ctx, a.gatewayURL, "stream-1", "control-jwt", nil, NotifyHandlers{
+		OnAgentToolFailure: func(failure AgentToolFailure) { received <- failure },
+	})
+	require.NoError(a.t, err)
+	defer subscription.Close()
+	select {
+	case failure := <-received:
+		return failure
+	case <-ctx.Done():
+		a.t.Fatal("tool failure was not delivered")
+		return AgentToolFailure{}
+	}
+}
+
+// ToolFailureArrivesWhileCallRuns holds a tool handler open and observes whether
+// its failure callback arrives before that handler is allowed to return.
+func (a *NotifyGatewayActor) ToolFailureArrivesWhileCallRuns(ctx context.Context, reason string) bool {
+	a.t.Helper()
+	a.EnqueueAgentToolCall("call_1")
+	a.EnqueueAgentToolFailure("call_1", reason)
+
+	started := make(chan struct{})
+	failed := make(chan AgentToolFailure, 1)
+	release := make(chan struct{})
+	subscription, err := a.client.OpenNotify(ctx, a.gatewayURL, "stream-1", "control-jwt", nil, NotifyHandlers{
+		OnAgentToolCall: func(AgentToolCall) {
+			close(started)
+			<-release
+		},
+		OnAgentToolFailure: func(failure AgentToolFailure) { failed <- failure },
+	})
+	require.NoError(a.t, err)
+	defer subscription.Close()
+	recvWithin(a.t, started, "tool call start")
+
+	prompt := false
+	select {
+	case failure := <-failed:
+		prompt = failure == (AgentToolFailure{CallID: "call_1", Reason: reason})
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	return prompt
+}
+
+func (a *NotifyGatewayActor) CloseWithSaturatedToolHandlers() bool {
+	a.t.Helper()
+	for i := range maxConcurrentToolCalls + 1 {
+		a.EnqueueAgentToolCall(fmt.Sprintf("call_%d", i))
+	}
+	release := make(chan struct{})
+	started := make(chan struct{}, maxConcurrentToolCalls+1)
+	subscription, err := a.client.OpenNotify(context.Background(), a.gatewayURL, "stream-1", "control-jwt", nil, NotifyHandlers{
+		OnAgentToolCall: func(AgentToolCall) {
+			started <- struct{}{}
+			<-release
+		},
+	})
+	require.NoError(a.t, err)
+	for range maxConcurrentToolCalls {
+		recvWithin(a.t, started, "saturated tool handler")
+	}
+	require.NoError(a.t, subscription.Close())
+
+	closed := false
+	select {
+	case <-subscription.Done():
+		closed = true
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	if !closed {
+		select {
+		case <-subscription.Done():
+		case <-time.After(time.Second):
+			a.t.Fatal("subscription did not close after releasing tool handlers")
+		}
+	}
+	return closed
+}
+
 // Frames returns the frames the subscription delivered, in order.
 func (a *NotifyGatewayActor) Frames() []NotifyEvent {
 	a.mu.Lock()
@@ -550,6 +725,27 @@ func (a *NotifyGatewayActor) StreamUtterance(ctx context.Context, id string, chu
 	want := len(chunks) + 2
 	for range 100 {
 		if len(a.gateway.receivedMessages()) >= want {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_ = subscription.Close()
+	return a.gateway.receivedMessages()
+}
+
+func (a *NotifyGatewayActor) ConfigureAgent(ctx context.Context) []notifyWire {
+	a.t.Helper()
+	subscription, err := a.client.OpenNotify(ctx, a.gatewayURL, "stream-1", "control-jwt", nil, NotifyHandlers{})
+	require.NoError(a.t, err)
+	require.NoError(a.t, subscription.Configure("legacy prompt"))
+	require.NoError(a.t, subscription.ConfigureAgent(AgentConfiguration{
+		Instructions: "tool prompt",
+		Tools:        []AgentTool{{Name: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		ToolChoice:   "required",
+		ToolTimeout:  250 * time.Millisecond,
+	}))
+	for range 100 {
+		if len(a.gateway.receivedMessages()) >= 2 {
 			break
 		}
 		time.Sleep(time.Millisecond)

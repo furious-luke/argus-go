@@ -3,6 +3,7 @@ package argus
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -101,6 +102,16 @@ type NotifyHandlers struct {
 	OnAgentEngaged    func()
 	OnAgentError      func(reason string)
 	OnAgentTranscript func(text string)
+	// OnAgentToolCall fires when the agent calls a declared tool. The customer server
+	// runs the function and returns the result with NotifySubscription.SubmitToolResult
+	// (or SubmitToolError), correlating by AgentToolCall.CallID. If unset, tool calls
+	// go unanswered and time out on the server.
+	OnAgentToolCall func(call AgentToolCall)
+	// OnAgentToolFailure reports that a previously delivered call can no longer
+	// accept a result, carrying its call id and stable timeout/session-loss reason.
+	// It may run concurrently with OnAgentToolCall when the call fails before that
+	// handler returns.
+	OnAgentToolFailure func(failure AgentToolFailure)
 }
 
 type UtteranceEvent struct {
@@ -177,6 +188,7 @@ func (e *NotifyTerminalError) NotifyTerminalReason() string { return e.Reason }
 type NotifySubscription struct {
 	conn      *websocket.Conn
 	ctx       context.Context
+	toolCalls *toolCallDispatcher
 	writeMu   sync.Mutex
 	done      chan struct{}
 	errMu     sync.Mutex
@@ -330,13 +342,51 @@ func (s *NotifySubscription) CancelSpeech(scope string) error {
 	return s.send(notifyWire{Type: notifyMsgUtteranceCancel, Scope: scope})
 }
 
-// Configure sets the realtime agent's system prompt and engages it. It is the
-// first command a realtime-mode stream sends; before it, the agent is dormant and
-// produces no response. Sending it again while engaged replaces the instructions
-// for subsequent turns. The agent's voice is pinned when the stream is created
-// (JoinOptions.Agent) and cannot be changed for the session.
+// Configure sets the realtime agent's system prompt and engages it. It preserves
+// the original prompt-only SDK surface; configuring this way clears any previously
+// declared tools, just like a full configuration with an empty tool set.
 func (s *NotifySubscription) Configure(instructions string) error {
-	return s.send(notifyWire{Type: notifyMsgAgentConfigure, Instructions: instructions})
+	return s.ConfigureAgent(AgentConfiguration{Instructions: instructions})
+}
+
+// ConfigureAgent sets the realtime agent's complete behavior and engages it. It
+// is the first command a realtime-mode stream sends; before it, the agent is dormant
+// and produces no response. Sending it again is a full replacement of the prompt
+// and callable tool surface for subsequent turns.
+func (s *NotifySubscription) ConfigureAgent(cfg AgentConfiguration) error {
+	return s.send(notifyWire{
+		Type:          notifyMsgAgentConfigure,
+		Instructions:  cfg.Instructions,
+		Tools:         toToolWire(cfg.Tools),
+		ToolChoice:    cfg.ToolChoice,
+		ToolTimeoutMs: int(cfg.ToolTimeout / time.Millisecond),
+	})
+}
+
+// SubmitToolResult returns a tool call's result to the agent, correlated by callID
+// (from the AgentToolCall). It resumes the interrupted turn so the agent can use the
+// result; when the agent made several parallel calls, submit each one's result and
+// the turn resumes once all are in.
+func (s *NotifySubscription) SubmitToolResult(callID, output string) error {
+	return s.send(notifyWire{Type: notifyMsgAgentToolResult, CallID: callID, Output: output})
+}
+
+// SubmitToolError returns a tool call's failure to the agent, correlated by callID,
+// so the agent can react to the error rather than waiting out the call's deadline.
+func (s *NotifySubscription) SubmitToolError(callID, errText string) error {
+	return s.send(notifyWire{Type: notifyMsgAgentToolResult, CallID: callID, Error: errText})
+}
+
+// toToolWire converts the SDK tool declarations to the wire shape.
+func toToolWire(tools []AgentTool) []toolWire {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]toolWire, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, toolWire{Name: t.Name, Description: t.Description, Parameters: t.Parameters})
+	}
+	return out
 }
 
 // UpdatePrompt replaces the realtime agent's system prompt for subsequent turns,
@@ -355,7 +405,10 @@ func (s *NotifySubscription) SendMessage(role, content string, respond bool) err
 
 func (s *NotifySubscription) Close() error {
 	var err error
-	s.closeOnce.Do(func() { err = s.conn.Close() })
+	s.closeOnce.Do(func() {
+		s.toolCalls.close()
+		err = s.conn.Close()
+	})
 	return err
 }
 
@@ -385,6 +438,8 @@ func (c *Client) Subscribe(ctx context.Context, gatewayURL, streamID, controlTok
 	}
 	connected := false
 	backoff := notifyReconnectMinBackoff
+	toolCalls := newToolCallDispatcher(ctx, handlers.OnAgentToolCall, handlers.OnAgentToolFailure)
+	defer toolCalls.close()
 	for {
 		header := http.Header{"Authorization": []string{"Bearer " + controlToken}}
 		conn, resp, dialErr := dialer.DialContext(ctx, wsURL, header)
@@ -407,7 +462,7 @@ func (c *Client) Subscribe(ctx context.Context, gatewayURL, streamID, controlTok
 
 		connected = true
 		backoff = notifyReconnectMinBackoff
-		terminal, readErr := readNotifyConnection(ctx, conn, streamID, handlers)
+		terminal, readErr := readNotifyConnection(ctx, conn, streamID, handlers, toolCalls)
 		_ = conn.Close()
 		if terminal {
 			return readErr
@@ -440,7 +495,8 @@ func (c *Client) OpenNotify(ctx context.Context, gatewayURL, streamID, controlTo
 	if err != nil {
 		return nil, notifyHandshakeError(response, err)
 	}
-	subscription := &NotifySubscription{conn: conn, ctx: ctx, done: make(chan struct{}), transcriptAnchors: make(map[uint64]time.Time)}
+	toolCalls := newToolCallDispatcher(ctx, handlers.OnAgentToolCall, handlers.OnAgentToolFailure)
+	subscription := &NotifySubscription{conn: conn, ctx: ctx, toolCalls: toolCalls, done: make(chan struct{}), transcriptAnchors: make(map[uint64]time.Time)}
 	originalTranscriptHandler := handlers.OnTranscript
 	handlers.OnTranscript = func(text string, transcriptionID uint64) {
 		subscription.recordTranscriptAnchor(transcriptionID, time.Now())
@@ -449,7 +505,7 @@ func (c *Client) OpenNotify(ctx context.Context, gatewayURL, streamID, controlTo
 		}
 	}
 	go func() {
-		_, readErr := readNotifyConnection(ctx, conn, streamID, handlers)
+		_, readErr := readNotifyConnection(ctx, conn, streamID, handlers, toolCalls)
 		subscription.errMu.Lock()
 		subscription.err = readErr
 		subscription.errMu.Unlock()
@@ -462,11 +518,188 @@ func (c *Client) OpenNotify(ctx context.Context, gatewayURL, streamID, controlTo
 const (
 	notifyReconnectMinBackoff = 100 * time.Millisecond
 	notifyReconnectMaxBackoff = 5 * time.Second
+	maxConcurrentToolCalls    = 16
+	maxQueuedToolCallbacks    = 256
 )
+
+// toolCallDispatcher keeps potentially synchronous customer functions off the
+// WebSocket reader while bounding the number of callbacks a peer can run at once.
+// One dispatcher spans transparent reconnects for a Subscribe call, so repeated
+// transport loss cannot reset the concurrency bound.
+type toolCallDispatcher struct {
+	ctx            context.Context
+	cancel         context.CancelFunc
+	callHandler    func(AgentToolCall)
+	failureHandler func(AgentToolFailure)
+	jobs           chan toolCallbackJob
+	mu             sync.Mutex
+	calls          map[string]*toolCallbackState
+	startOnce      sync.Once
+	closeOnce      sync.Once
+}
+
+type toolCallbackJob struct {
+	call    *AgentToolCall
+	state   *toolCallbackState
+	failure *AgentToolFailure
+}
+
+type toolCallbackState struct {
+	started           chan struct{}
+	failureDispatched bool
+}
+
+func newToolCallDispatcher(ctx context.Context, callHandler func(AgentToolCall), failureHandler func(AgentToolFailure)) *toolCallDispatcher {
+	if callHandler == nil && failureHandler == nil {
+		return nil
+	}
+	dispatchCtx, cancel := context.WithCancel(ctx)
+	d := &toolCallDispatcher{
+		ctx: dispatchCtx, cancel: cancel, callHandler: callHandler, failureHandler: failureHandler,
+		calls: make(map[string]*toolCallbackState),
+	}
+	return d
+}
+
+func (d *toolCallDispatcher) start() bool {
+	if d.ctx.Err() != nil {
+		return false
+	}
+	d.startOnce.Do(func() {
+		d.jobs = make(chan toolCallbackJob, maxQueuedToolCallbacks)
+		go d.run()
+	})
+	return d.ctx.Err() == nil
+}
+
+func (d *toolCallDispatcher) dispatch(call AgentToolCall) bool {
+	if d == nil || d.callHandler == nil {
+		return true
+	}
+	if !d.start() {
+		return false
+	}
+	d.mu.Lock()
+	state := &toolCallbackState{started: make(chan struct{})}
+	d.calls[call.CallID] = state
+	d.mu.Unlock()
+	select {
+	case d.jobs <- toolCallbackJob{call: &call, state: state}:
+		return true
+	case <-d.ctx.Done():
+		d.forget(call.CallID)
+		return false
+	default:
+		d.forget(call.CallID)
+		return false
+	}
+}
+
+func (d *toolCallDispatcher) dispatchFailure(failure AgentToolFailure) bool {
+	if d == nil || d.failureHandler == nil {
+		return true
+	}
+	d.mu.Lock()
+	if state := d.calls[failure.CallID]; state != nil {
+		if state.failureDispatched {
+			d.mu.Unlock()
+			return true
+		}
+		state.failureDispatched = true
+		d.mu.Unlock()
+		go d.deliverActiveFailure(state, failure)
+		return true
+	}
+	d.mu.Unlock()
+	if !d.start() {
+		return false
+	}
+	select {
+	case d.jobs <- toolCallbackJob{failure: &failure}:
+		return true
+	case <-d.ctx.Done():
+		return false
+	default:
+		return false
+	}
+}
+
+// deliverActiveFailure preserves the call-before-failure relationship without
+// coupling notification to the customer tool's completion. It exits with the
+// subscription if a queued call never starts.
+func (d *toolCallDispatcher) deliverActiveFailure(state *toolCallbackState, failure AgentToolFailure) {
+	select {
+	case <-state.started:
+	case <-d.ctx.Done():
+		return
+	}
+	if d.ctx.Err() == nil {
+		d.failureHandler(failure)
+	}
+}
+
+func (d *toolCallDispatcher) run() {
+	done := make(chan struct{}, maxConcurrentToolCalls)
+	active := 0
+	for {
+		var jobs <-chan toolCallbackJob
+		if active < maxConcurrentToolCalls {
+			jobs = d.jobs
+		}
+		select {
+		case <-d.ctx.Done():
+			return
+		case job := <-jobs:
+			active++
+			go d.runJob(job, done)
+		case <-done:
+			active--
+		}
+	}
+}
+
+func (d *toolCallDispatcher) runJob(job toolCallbackJob, done chan<- struct{}) {
+	defer func() {
+		select {
+		case done <- struct{}{}:
+		case <-d.ctx.Done():
+		}
+	}()
+	if d.ctx.Err() != nil {
+		return
+	}
+	if job.call != nil {
+		close(job.state.started)
+		d.callHandler(*job.call)
+		d.mu.Lock()
+		if d.calls[job.call.CallID] == job.state {
+			delete(d.calls, job.call.CallID)
+		}
+		d.mu.Unlock()
+	} else if job.failure != nil {
+		d.failureHandler(*job.failure)
+	}
+}
+
+func (d *toolCallDispatcher) forget(callID string) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	delete(d.calls, callID)
+	d.mu.Unlock()
+}
+
+func (d *toolCallDispatcher) close() {
+	if d == nil {
+		return
+	}
+	d.closeOnce.Do(d.cancel)
+}
 
 // readNotifyConnection serves one established socket. terminal is false only
 // for an unexpected transport loss, which Subscribe reconnects transparently.
-func readNotifyConnection(ctx context.Context, conn *websocket.Conn, streamID string, handlers NotifyHandlers) (terminal bool, result error) {
+func readNotifyConnection(ctx context.Context, conn *websocket.Conn, streamID string, handlers NotifyHandlers, toolCalls *toolCallDispatcher) (terminal bool, result error) {
 	stopCancelWatch := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopCancelWatch()
 
@@ -549,6 +782,14 @@ func readNotifyConnection(ctx context.Context, conn *websocket.Conn, streamID st
 			if handlers.OnAgentEngaged != nil {
 				handlers.OnAgentEngaged()
 			}
+		case notifyMsgAgentToolCall:
+			if !toolCalls.dispatch(AgentToolCall{CallID: msg.CallID, Name: msg.ToolName, Arguments: msg.Arguments}) {
+				return true, fmt.Errorf("agent tool callback queue saturated")
+			}
+		case notifyMsgAgentToolFailed:
+			if !toolCalls.dispatchFailure(AgentToolFailure{CallID: msg.CallID, Reason: msg.Reason}) {
+				return true, fmt.Errorf("agent tool callback queue saturated")
+			}
 		case notifyMsgAgentError:
 			if handlers.OnAgentError != nil {
 				handlers.OnAgentError(msg.Reason)
@@ -621,6 +862,23 @@ type notifyWire struct {
 	Role         string `json:"role,omitempty"`
 	Content      string `json:"content,omitempty"`
 	Respond      *bool  `json:"respond,omitempty"`
+	// Realtime-agent tools (agent_configure outbound; tool call inbound / result
+	// outbound).
+	Tools         []toolWire `json:"tools,omitempty"`
+	ToolChoice    string     `json:"tool_choice,omitempty"`
+	ToolTimeoutMs int        `json:"tool_timeout_ms,omitempty"`
+	CallID        string     `json:"call_id,omitempty"`
+	ToolName      string     `json:"tool_name,omitempty"`
+	Arguments     string     `json:"arguments,omitempty"`
+	Output        string     `json:"output,omitempty"`
+	Error         string     `json:"error,omitempty"`
+}
+
+// toolWire mirrors the gateway's notify.Tool JSON.
+type toolWire struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 type applicationTurnTimingWire struct {
@@ -662,6 +920,9 @@ const (
 	notifyMsgAgentMessage             = "agent_message"
 	notifyMsgAgentEngaged             = "agent_engaged"
 	notifyMsgAgentError               = "agent_error"
+	notifyMsgAgentToolCall            = "agent_tool_call"
+	notifyMsgAgentToolResult          = "agent_tool_result"
+	notifyMsgAgentToolFailed          = "agent_tool_failed"
 )
 
 // Realtime-agent injected-message roles for NotifySubscription.SendMessage.
