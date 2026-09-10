@@ -125,6 +125,12 @@ type JoinOptions struct {
 	// fleet-default voices. Discover valid selections with GetVoices. It is
 	// server-side only, like the transcription options.
 	Voice *VoiceConfig
+	// Agent is the optional realtime-agent configuration. When set with Mode
+	// "realtime", the stream hosts a conversational voice agent in the media server
+	// instead of the brokered STT/TTS loop; the customer server drives it at runtime
+	// over the notify socket. Nil means an ordinary brokered stream. Server-side
+	// only, like the transcription options.
+	Agent *AgentConfig
 }
 
 // RefreshControlToken replaces an expiring control token. Once placement has
@@ -185,6 +191,7 @@ type joinStreamBody struct {
 	Keyterms               []string     `json:"keyterms,omitempty"`
 	TranscriptionProviders []string     `json:"transcription_providers,omitempty"`
 	Voice                  *VoiceConfig `json:"voice,omitempty"`
+	Agent                  *AgentConfig `json:"agent,omitempty"`
 }
 
 // JoinStream creates a new stream with default options and returns its join
@@ -206,6 +213,7 @@ func (c *Client) JoinStreamWithOptions(ctx context.Context, opts *JoinOptions) (
 		body.Keyterms = opts.Keyterms
 		body.TranscriptionProviders = opts.TranscriptionProviders
 		body.Voice = opts.Voice
+		body.Agent = opts.Agent
 	}
 
 	payload, err := json.Marshal(body)

@@ -90,6 +90,17 @@ type NotifyHandlers struct {
 	// newer one (e.g. the browser reconnected to a different node). After it
 	// fires, Subscribe returns.
 	OnEnded func(reason string)
+
+	// Realtime-agent handlers (only fire on a realtime-mode stream). OnAgentEngaged
+	// fires when the agent accepts a configuration and begins responding.
+	// OnAgentError fires when configuration or the provider connection fails
+	// (reason is a stable machine-readable code). OnAgentTranscript receives the
+	// agent's OWN spoken-turn transcript; the user's speech continues to arrive on
+	// OnTranscript. Both feed a customer's stored transcript when the agent, rather
+	// than the customer server, produces the response.
+	OnAgentEngaged    func()
+	OnAgentError      func(reason string)
+	OnAgentTranscript func(text string)
 }
 
 type UtteranceEvent struct {
@@ -319,6 +330,29 @@ func (s *NotifySubscription) CancelSpeech(scope string) error {
 	return s.send(notifyWire{Type: notifyMsgUtteranceCancel, Scope: scope})
 }
 
+// Configure sets the realtime agent's system prompt and engages it. It is the
+// first command a realtime-mode stream sends; before it, the agent is dormant and
+// produces no response. Sending it again while engaged replaces the instructions
+// for subsequent turns. The agent's voice is pinned when the stream is created
+// (JoinOptions.Agent) and cannot be changed for the session.
+func (s *NotifySubscription) Configure(instructions string) error {
+	return s.send(notifyWire{Type: notifyMsgAgentConfigure, Instructions: instructions})
+}
+
+// UpdatePrompt replaces the realtime agent's system prompt for subsequent turns,
+// leaving its voice unchanged. Honored only after Configure.
+func (s *NotifySubscription) UpdatePrompt(instructions string) error {
+	return s.send(notifyWire{Type: notifyMsgAgentPromptUpdate, Instructions: instructions})
+}
+
+// SendMessage injects a conversation item into the realtime agent's context with
+// the given role (AgentRole*). When respond is true it also asks the agent to
+// speak now; otherwise the item is context for the agent's next turn. Honored only
+// after Configure.
+func (s *NotifySubscription) SendMessage(role, content string, respond bool) error {
+	return s.send(notifyWire{Type: notifyMsgAgentMessage, Role: role, Content: content, Respond: &respond})
+}
+
 func (s *NotifySubscription) Close() error {
 	var err error
 	s.closeOnce.Do(func() { err = s.conn.Close() })
@@ -477,7 +511,13 @@ func readNotifyConnection(ctx context.Context, conn *websocket.Conn, streamID st
 				handlers.OnSpeechStarted()
 			}
 		case notifyMsgTranscript:
-			if handlers.OnTranscript != nil {
+			// A realtime agent's own turn transcript carries role "assistant"; the
+			// user's speech carries no role. Route them to distinct handlers.
+			if msg.Role == AgentRoleAssistant {
+				if handlers.OnAgentTranscript != nil {
+					handlers.OnAgentTranscript(msg.Text)
+				}
+			} else if handlers.OnTranscript != nil {
 				handlers.OnTranscript(msg.Text, msg.TranscriptionID)
 			}
 		case notifyMsgNoSpeech:
@@ -504,6 +544,14 @@ func readNotifyConnection(ctx context.Context, conn *websocket.Conn, streamID st
 		case notifyMsgUserText:
 			if handlers.OnUserText != nil {
 				handlers.OnUserText(msg.MessageID, msg.Text)
+			}
+		case notifyMsgAgentEngaged:
+			if handlers.OnAgentEngaged != nil {
+				handlers.OnAgentEngaged()
+			}
+		case notifyMsgAgentError:
+			if handlers.OnAgentError != nil {
+				handlers.OnAgentError(msg.Reason)
 			}
 		case notifyMsgTokenExpiring:
 			if handlers.OnTokenExpiring != nil {
@@ -568,6 +616,11 @@ type notifyWire struct {
 	TextComplete      *bool                      `json:"text_complete,omitempty"`
 	TranscriptionID   uint64                     `json:"transcription_id,omitempty"`
 	ApplicationTiming *applicationTurnTimingWire `json:"application_timing,omitempty"`
+	// Realtime-agent control (outbound) and lifecycle (inbound).
+	Instructions string `json:"instructions,omitempty"`
+	Role         string `json:"role,omitempty"`
+	Content      string `json:"content,omitempty"`
+	Respond      *bool  `json:"respond,omitempty"`
 }
 
 type applicationTurnTimingWire struct {
@@ -604,6 +657,18 @@ const (
 	notifyMsgUtteranceFailed          = "utterance_failed"
 	notifyMsgUtteranceRejected        = "utterance_rejected"
 	notifyMsgUserText                 = "user_text"
+	notifyMsgAgentConfigure           = "agent_configure"
+	notifyMsgAgentPromptUpdate        = "agent_prompt_update"
+	notifyMsgAgentMessage             = "agent_message"
+	notifyMsgAgentEngaged             = "agent_engaged"
+	notifyMsgAgentError               = "agent_error"
+)
+
+// Realtime-agent injected-message roles for NotifySubscription.SendMessage.
+const (
+	AgentRoleUser      = "user"
+	AgentRoleSystem    = "system"
+	AgentRoleAssistant = "assistant"
 )
 
 // notifyWSURL builds the gateway /notify WebSocket URL, normalizing http(s) to
