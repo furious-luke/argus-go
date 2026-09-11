@@ -84,3 +84,87 @@ const (
 	AgentToolFailureReasonTimeout     = "tool call timed out"
 	AgentToolFailureReasonSessionLost = "provider session lost during tool call"
 )
+
+// WorkerReadiness is a worker strand's content state.
+type WorkerReadiness string
+
+const (
+	WorkerWorking WorkerReadiness = "working" // producing; nothing to deliver yet
+	WorkerReady   WorkerReadiness = "ready"   // content waiting to be delivered
+	WorkerDone    WorkerReadiness = "done"    // finished; the strand is retired
+)
+
+// WorkerFloor is how a strand competes for the conversational floor.
+type WorkerFloor string
+
+const (
+	FloorAdopts   WorkerFloor = "adopts"   // take the floor only when nothing else holds it
+	FloorReclaims WorkerFloor = "reclaims" // hold/retake the floor for the strand's active life
+	FloorSeizes   WorkerFloor = "seizes"   // interrupt to take the floor while it has content
+)
+
+// WorkerMultiplicity is whether a kind keeps one strand or many.
+type WorkerMultiplicity string
+
+const (
+	Singleton  WorkerMultiplicity = "singleton"  // a new unit supersedes the prior
+	Concurrent WorkerMultiplicity = "concurrent" // many coexist up to ConcurrentCap
+)
+
+// NoticeEnvelope frames a backgrounded update that does not hold the floor.
+type NoticeEnvelope string
+
+const (
+	Informational NoticeEnvelope = "informational" // mention it; don't act unless asked
+	Actionable    NoticeEnvelope = "actionable"    // act on this as instructed
+)
+
+// WorkerTraits are the attention traits a worker declares for a strand so Argus can
+// arbitrate it without knowing the worker's type. They are honored when the strand is
+// first created (its first push); empty fields take Argus's defaults (adopts,
+// singleton, informational).
+type WorkerTraits struct {
+	Multiplicity   WorkerMultiplicity
+	Floor          WorkerFloor
+	Priority       int
+	NoticeEnvelope NoticeEnvelope
+	// ConcurrentCap bounds live strands of a Concurrent kind; zero uses the default.
+	ConcurrentCap int
+}
+
+// WorkerPushRejection reports that a PushWorker update was not accepted by the agent, so
+// its content was not delivered. The worker should hold the unit and retry — a successful
+// PushWorker call only means the update reached the server, not that it was accepted.
+// WorkerKind and StrandID identify the rejected push; Reason carries why.
+type WorkerPushRejection struct {
+	WorkerKind string
+	StrandID   string
+	Reason     string
+}
+
+// Stable reasons carried by WorkerPushRejection.Reason.
+const (
+	// WorkerPushRejectionReasonConcurrentCap means a concurrent kind was at its
+	// per-stream cap with every live strand still working, so the new unit was dropped
+	// rather than evicting in-flight work.
+	WorkerPushRejectionReasonConcurrentCap = "concurrent strand cap reached"
+	// WorkerPushRejectionReasonInvalidIdentity means the update was missing its worker
+	// kind or strand id; both are required to identify a strand.
+	WorkerPushRejectionReasonInvalidIdentity = "worker kind and strand id are required"
+)
+
+// WorkerUpdate is one push from a background worker on the customer server to the
+// agent, sent with NotifySubscription.PushWorker. WorkerKind identifies the producing
+// worker and StrandID the stream of output it maintains; Content is the already-
+// prepared text to voice or consider (present when Readiness is WorkerReady). Awaited
+// marks the deferred result of a "being prepared" tool call the user is waiting for,
+// so Argus delivers it directly rather than as a passing notice. Traits are honored on
+// the strand's first push.
+type WorkerUpdate struct {
+	WorkerKind string
+	StrandID   string
+	Readiness  WorkerReadiness
+	Content    string
+	Awaited    bool
+	Traits     *WorkerTraits
+}

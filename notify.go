@@ -112,6 +112,11 @@ type NotifyHandlers struct {
 	// It may run concurrently with OnAgentToolCall when the call fails before that
 	// handler returns.
 	OnAgentToolFailure func(failure AgentToolFailure)
+	// OnWorkerPushRejection reports that a PushWorker update was not accepted by the
+	// agent (for example, a concurrent kind at its per-stream cap), so its content was
+	// not delivered. The worker should hold the unit and retry rather than assume it
+	// landed. If unset, rejections are dropped.
+	OnWorkerPushRejection func(rejection WorkerPushRejection)
 }
 
 type UtteranceEvent struct {
@@ -375,6 +380,33 @@ func (s *NotifySubscription) SubmitToolResult(callID, output string) error {
 // so the agent can react to the error rather than waiting out the call's deadline.
 func (s *NotifySubscription) SubmitToolError(callID, errText string) error {
 	return s.send(notifyWire{Type: notifyMsgAgentToolResult, CallID: callID, Error: errText})
+}
+
+// PushWorker sends a background worker's content to the agent (see WorkerUpdate). The
+// media server's attention arbiter decides whether it is spoken now, held as a
+// context notice, or suppressed, reconciled against the live turn. Tools stay
+// synchronous; this is the only asynchronous lane. Use it for a deferred result (a
+// tool that returned "being prepared") or an unprompted observation. Traits are
+// honored when the strand is first created (its first push).
+func (s *NotifySubscription) PushWorker(u WorkerUpdate) error {
+	w := notifyWire{
+		Type:       notifyMsgWorkerPush,
+		WorkerKind: u.WorkerKind,
+		StrandID:   u.StrandID,
+		Readiness:  string(u.Readiness),
+		Content:    u.Content,
+		Awaited:    u.Awaited,
+	}
+	if u.Traits != nil {
+		w.Traits = &traitsWire{
+			Multiplicity:   string(u.Traits.Multiplicity),
+			Floor:          string(u.Traits.Floor),
+			Priority:       u.Traits.Priority,
+			NoticeEnvelope: string(u.Traits.NoticeEnvelope),
+			ConcurrentCap:  u.Traits.ConcurrentCap,
+		}
+	}
+	return s.send(w)
 }
 
 // toToolWire converts the SDK tool declarations to the wire shape.
@@ -790,6 +822,14 @@ func readNotifyConnection(ctx context.Context, conn *websocket.Conn, streamID st
 			if !toolCalls.dispatchFailure(AgentToolFailure{CallID: msg.CallID, Reason: msg.Reason}) {
 				return true, fmt.Errorf("agent tool callback queue saturated")
 			}
+		case notifyMsgWorkerPushRejected:
+			if handlers.OnWorkerPushRejection != nil {
+				handlers.OnWorkerPushRejection(WorkerPushRejection{
+					WorkerKind: msg.WorkerKind,
+					StrandID:   msg.StrandID,
+					Reason:     msg.Reason,
+				})
+			}
 		case notifyMsgAgentError:
 			if handlers.OnAgentError != nil {
 				handlers.OnAgentError(msg.Reason)
@@ -872,6 +912,21 @@ type notifyWire struct {
 	Arguments     string     `json:"arguments,omitempty"`
 	Output        string     `json:"output,omitempty"`
 	Error         string     `json:"error,omitempty"`
+	// Agent-worker push (outbound).
+	WorkerKind string      `json:"worker_kind,omitempty"`
+	StrandID   string      `json:"strand_id,omitempty"`
+	Readiness  string      `json:"readiness,omitempty"`
+	Awaited    bool        `json:"awaited,omitempty"`
+	Traits     *traitsWire `json:"traits,omitempty"`
+}
+
+// traitsWire mirrors the gateway's notify.WorkerTraits JSON.
+type traitsWire struct {
+	Multiplicity   string `json:"multiplicity,omitempty"`
+	Floor          string `json:"floor,omitempty"`
+	Priority       int    `json:"priority,omitempty"`
+	NoticeEnvelope string `json:"notice_envelope,omitempty"`
+	ConcurrentCap  int    `json:"concurrent_cap,omitempty"`
 }
 
 // toolWire mirrors the gateway's notify.Tool JSON.
@@ -923,6 +978,8 @@ const (
 	notifyMsgAgentToolCall            = "agent_tool_call"
 	notifyMsgAgentToolResult          = "agent_tool_result"
 	notifyMsgAgentToolFailed          = "agent_tool_failed"
+	notifyMsgWorkerPush               = "worker_push"
+	notifyMsgWorkerPushRejected       = "worker_push_rejected"
 )
 
 // Realtime-agent injected-message roles for NotifySubscription.SendMessage.
