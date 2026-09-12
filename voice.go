@@ -18,6 +18,13 @@ type VoiceConfig struct {
 	// version returned by GetVoices; a stale version is rejected so a stream is
 	// never created from stale discovery data.
 	CatalogVersion string `json:"catalogVersion,omitempty"`
+	// Language is an optional BCP-47 synthesis language/accent (e.g. "en-GB")
+	// applied to every provider in the resolved plan. It is the accent lever for
+	// providers whose accent is language-driven (e.g. Gemini, which otherwise
+	// defaults to en-US); providers whose accent is intrinsic to the voice ID
+	// (ElevenLabs) still take their accent from the selected voice. Empty leaves
+	// each provider on its own default.
+	Language string `json:"language,omitempty"`
 	// Name selects a neutral catalog voice that maps to a concrete vendor voice
 	// for every provider in the chain, so it survives provider fallback.
 	Name string `json:"name,omitempty"`
